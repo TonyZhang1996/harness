@@ -12,3 +12,5 @@ venv/
 .pytest_cache/
 build/
 dist/
+
+.DS_Store
