@@ -15,7 +15,9 @@ AgentSession --- conversation history
                  +--- workspace and allowed-root resolver
                  +--- file/search/edit tools
                  +--- Git inspection tools
-                 +--- approved shell execution
+                 +--- platform adapter
+                        +--- PowerShell / zsh / bash
+                        +--- DirectShow / AVFoundation / V4L2
 ```
 
 ## Components
@@ -24,10 +26,12 @@ AgentSession --- conversation history
 - `model.py`：创建 OpenAI 兼容客户端。
 - `agent.py`：维护对话、调用模型、分发工具并报告事件。
 - `tools.py`：实现路径隔离、文件操作、搜索、Git 检查和命令执行。
-- 摄像头工具通过 macOS AVFoundation 和本机 FFmpeg 采集单帧，并校验输出文件。
+- 命令工具根据系统选择 PowerShell、zsh 或 bash/sh。
+- 摄像头工具通过 FFmpeg 的 Windows DirectShow、macOS AVFoundation 或 Linux V4L2 后端采集单帧，并校验输出文件。
 - `approval.py`：处理 Shell 命令审批策略。
 - `cli.py`：提供单次任务和连续交互界面。
-- `bin/harness`：从任意目录启动项目虚拟环境，并让配置层安全解析本地 `.env`。
+- Python console script 提供跨平台 `harness` 命令，`python -m ai_harness` 提供通用备用入口。
+- `bin/harness`：保留给已有 macOS 本地开发安装的兼容启动器。
 
 ## Trust boundaries
 

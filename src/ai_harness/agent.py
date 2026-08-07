@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
@@ -14,6 +15,7 @@ from .config import ModelConfig
 from .model import create_client
 from .tools import (
     _get_allowed_roots,
+    _get_filesystem_roots,
     capture_photo,
     create_directory,
     create_file,
@@ -156,13 +158,16 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "capture_photo",
-            "description": "Capture one photo from a macOS camera and save it as JPEG or PNG.",
+            "description": "Capture one photo from the host camera and save it as JPEG or PNG.",
             "parameters": _object_schema(
                 {
                     "path": PATH_PROPERTY,
                     "device": {
                         "type": "string",
-                        "description": "AVFoundation camera index or name; default is 0.",
+                        "description": (
+                            "Camera index or name. Windows accepts a DirectShow name, "
+                            "Linux accepts a /dev/video path, and the default is 0."
+                        ),
                     },
                     "warmup_seconds": {
                         "type": "number",
@@ -244,9 +249,9 @@ def _handlers_for_workspace(
     """Bind every tool to one workspace, extra roots, and approval policy."""
     authorized = list(allowed_paths or ())
     if full_access:
-        filesystem_root = Path(Path.cwd().anchor or "/")
-        if filesystem_root not in authorized:
-            authorized.append(filesystem_root)
+        for filesystem_root in _get_filesystem_roots():
+            if filesystem_root not in authorized:
+                authorized.append(filesystem_root)
     authorized_paths = tuple(authorized)
     _get_allowed_roots(workspace, authorized_paths)
     handlers: dict[str, Callable[..., str]] = {}
@@ -399,6 +404,10 @@ class AgentSession:
         return self.permission_mode
 
     def _system_prompt(self) -> str:
+        system_name = platform.system() or os.name
+        native_shell = "PowerShell" if system_name == "Windows" else (
+            "zsh" if system_name == "Darwin" else "bash/sh"
+        )
         if self.full_access:
             permission_context = (
                 "Active permission mode: full-access. Tools may access the entire local "
@@ -416,7 +425,11 @@ class AgentSession:
                 f"{self.approval_mode}. File access is limited to the workspace and "
                 f"explicitly authorized directories. {approval_context}"
             )
-        return f"{SYSTEM_PROMPT}\n\n{permission_context}"
+        platform_context = (
+            f"Host operating system: {system_name}. Native command shell: {native_shell}. "
+            "Generate commands and paths that are valid for this operating system."
+        )
+        return f"{SYSTEM_PROMPT}\n\n{platform_context}\n{permission_context}"
 
     def _emit(self, kind: str, message: str) -> None:
         if self.event_callback:

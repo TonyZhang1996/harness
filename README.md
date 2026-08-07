@@ -1,6 +1,6 @@
 # AI Harness
 
-AI Harness 是一个安全、可扩展的本地编码 Agent。它通过 OpenAI 兼容接口连接模型，在受控工作区中读取、搜索、创建、修改和删除文件，并在用户审批后执行命令、运行测试和检查 Git 状态。
+AI Harness 是一个安全、跨平台、可扩展的本地编码 Agent。它通过 OpenAI 兼容接口连接模型，在受控工作区中读取、搜索、创建、修改和删除文件，并在用户审批后执行命令、运行测试和检查 Git 状态。
 
 ## 功能
 
@@ -9,42 +9,66 @@ AI Harness 是一个安全、可扩展的本地编码 Agent。它通过 OpenAI �
 - 文件读取、目录浏览、全文搜索和精确文本编辑
 - 文件与空目录的创建、修改和安全删除
 - Git 状态与差异读取
-- macOS 摄像头拍照并保存为 JPEG/PNG
-- Shell 命令审批、超时和输出限制
+- Windows、macOS、Linux 摄像头拍照并保存为 JPEG/PNG
+- 原生 Shell 命令审批、超时和输出限制
 - 工作区隔离与额外目录显式授权
 - 工具执行进度和可选 JSONL 日志
 - 全局 `harness` 启动入口
 
 ## 快速开始
 
-```bash
-cd /Users/zhangjie/Documents/harness
+macOS/Linux：
+
+```console
+cd /path/to/harness
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-编辑 `.env`：
+Windows PowerShell：
+
+```powershell
+cd C:\path\to\harness
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+Copy-Item .env.example .env
+```
+
+编辑当前目录的 `.env`：
 
 ```env
 DEEPSEEK_API_KEY="你的 API Key"
 AI_HARNESS_MODEL="deepseek-chat"
 ```
 
-项目启动脚本会自动加载 `.env`：
-
-```bash
-./bin/harness
-```
-
-如果已经将 `bin/harness` 链接到 `~/.local/bin/harness`，可以在任意目录直接运行：
+安装完成后，三个系统都使用相同命令：
 
 ```bash
 harness
 ```
 
-当前目录会成为默认工作区。
+也可以使用不依赖命令入口的通用启动方式：
+
+```bash
+python -m ai_harness
+```
+
+当前目录会成为默认工作区。`bin/harness` 只作为已有 macOS 安装的兼容启动器保留。
+
+如果希望退出虚拟环境后仍能在任意目录使用，可安装 [pipx](https://pipx.pypa.io/) 后在仓库根目录运行：
+
+```bash
+pipx install --editable .
+```
+
+模型配置可以放在当前目录的 `.env`，也可以放在跨平台用户配置文件 `~/.ai-harness/.env`（Windows 即 `%USERPROFILE%\.ai-harness\.env`）。还可以显式指定：
+
+```bash
+harness --env-file /path/to/config.env
+```
 
 ## 使用方式
 
@@ -81,6 +105,16 @@ harness --full-access
 ```
 
 `--full-access` 会允许访问整个文件系统、读取或修改敏感文件，并自动批准 Shell 命令。它等价于主动放弃工作区隔离和逐次审批，只应在可信任务中临时使用。退出该会话后，下次普通运行会恢复默认安全模式。
+
+平台后端会自动选择：
+
+| 系统 | 命令执行 | 摄像头 |
+| --- | --- | --- |
+| Windows | PowerShell (`pwsh`/Windows PowerShell) | FFmpeg DirectShow |
+| macOS | zsh | FFmpeg AVFoundation |
+| Linux | bash/sh | FFmpeg V4L2 |
+
+摄像头功能需要先安装 FFmpeg 并确保 `ffmpeg` 位于 `PATH`。Windows 可以传摄像头名称或数字索引，Linux 可以传索引或 `/dev/video*` 路径。
 
 交互命令：
 
@@ -139,7 +173,6 @@ AI_HARNESS_TIMEOUT="60"
 ## 开发
 
 ```bash
-source .venv/bin/activate
 python -m pytest
 ```
 
@@ -147,4 +180,4 @@ python -m pytest
 
 ## 当前边界
 
-AI Harness 0.2.0 是一个完整可用的本地编码 Agent MVP。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。
+AI Harness 0.3.0 是一个支持 Windows、macOS 和 Linux 的本地编码 Agent MVP。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。

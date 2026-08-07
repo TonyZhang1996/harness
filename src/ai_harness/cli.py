@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="完全访问文件系统、敏感文件，并自动允许 Shell 命令。",
     )
     parser.add_argument("--model", help="覆盖 AI_HARNESS_MODEL。")
+    parser.add_argument("--env-file", help="指定包含模型配置的 .env 文件。")
     parser.add_argument("--quiet-tools", action="store_true", help="隐藏工具进度。")
     parser.add_argument("--log-file", help="将工具事件以 JSONL 写入指定文件。")
     return parser
@@ -258,6 +260,10 @@ def run_interactive(
 def main() -> None:
     args = build_parser().parse_args()
     try:
+        if args.env_file:
+            os.environ["AI_HARNESS_ENV_FILE"] = str(
+                Path(args.env_file).expanduser().resolve()
+            )
         if args.task:
             session = _create_session(
                 max_turns=args.max_turns,

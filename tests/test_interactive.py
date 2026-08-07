@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import ai_harness.agent as agent_module
 from ai_harness import cli
 from ai_harness.agent import AgentSession
 
@@ -36,6 +37,14 @@ def test_agent_session_preserves_conversation_history():
     session.clear()
     assert len(session.messages) == 1
     assert session.messages[0]["role"] == "system"
+
+
+def test_system_prompt_describes_windows_shell(monkeypatch):
+    monkeypatch.setattr(agent_module.platform, "system", lambda: "Windows")
+    session = AgentSession(client=FakeClient(), model_name="test-model")
+
+    assert "Host operating system: Windows" in session.messages[0]["content"]
+    assert "Native command shell: PowerShell" in session.messages[0]["content"]
 
 
 def test_interactive_mode_supports_commands(monkeypatch, capsys):

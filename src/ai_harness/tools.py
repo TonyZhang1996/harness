@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -37,6 +39,27 @@ SENSITIVE_ENV_KEYS = {
     "OPENAI_API_KEY",
 }
 ApprovalCallback = Callable[[str, Path], bool]
+
+
+def _get_filesystem_roots() -> tuple[Path, ...]:
+    """Return every usable filesystem root for full-access mode."""
+    if platform.system() != "Windows":
+        return (Path("/"),)
+
+    try:
+        import ctypes
+
+        drive_mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except (AttributeError, OSError):
+        drive_mask = 0
+    roots = tuple(
+        Path(f"{chr(ord('A') + index)}:\\")
+        for index in range(26)
+        if drive_mask & (1 << index)
+    )
+    if roots:
+        return roots
+    return (Path(Path.cwd().anchor),)
 
 
 def _get_workspace_root(workspace_root: str | Path | None = None) -> Path:
@@ -110,7 +133,7 @@ def _resolve_workspace_path(
 def _display_path(path: Path, workspace_root: str | Path | None) -> str:
     root = _get_workspace_root(workspace_root)
     try:
-        return str(path.relative_to(root))
+        return path.relative_to(root).as_posix()
     except ValueError:
         return str(path)
 
@@ -176,7 +199,7 @@ def list_files(
         if any(part in DEFAULT_IGNORES for part in relative.parts):
             continue
         suffix = "/" if candidate.is_dir() else ""
-        entries.append(f"{relative}{suffix}")
+        entries.append(f"{relative.as_posix()}{suffix}")
         if len(entries) >= max_entries:
             entries.append("[结果已截断]")
             break
@@ -383,6 +406,35 @@ def _clean_subprocess_env() -> dict[str, str]:
     return environment
 
 
+def _shell_invocation(command: str) -> list[str]:
+    """Build a native shell invocation for Windows, macOS, or Linux."""
+    system = platform.system()
+    if system == "Windows":
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+        if not executable:
+            raise RuntimeError("未找到 PowerShell，无法在 Windows 上执行命令")
+        return [
+            executable,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ]
+
+    preferred = "zsh" if system == "Darwin" else "bash"
+    executable = shutil.which(preferred) or shutil.which("sh")
+    if not executable:
+        raise RuntimeError(f"未找到可用的 {preferred}/sh Shell")
+    return [executable, "-c", command]
+
+
+def _render_command(command: list[str]) -> str:
+    if platform.system() == "Windows":
+        return subprocess.list2cmdline(command)
+    return shlex.join(command)
+
+
 def run_command(
     command: str,
     cwd: str = ".",
@@ -410,9 +462,10 @@ def run_command(
     if approval_callback is None or not approval_callback(command, command_cwd):
         return "命令执行被用户或审批策略拒绝"
 
+    invocation = _shell_invocation(command)
     try:
         completed = subprocess.run(
-            ["/bin/zsh", "-c", command],
+            invocation,
             cwd=command_cwd,
             env=_clean_subprocess_env(),
             capture_output=True,
@@ -427,8 +480,43 @@ def run_command(
     output = completed.stdout + completed.stderr
     if len(output) > max_chars:
         output = output[:max_chars] + "\n[命令输出已截断]"
-    rendered = shlex.join(["/bin/zsh", "-c", command])
+    rendered = _render_command(invocation)
     return f"命令: {rendered}\n退出码: {completed.returncode}\n{output}".rstrip()
+
+
+def _windows_camera_name(ffmpeg: str, device: str) -> str:
+    """Resolve a DirectShow camera index to the device name FFmpeg expects."""
+    if not device.isdigit():
+        return device
+    completed = subprocess.run(
+        [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+        env=_clean_subprocess_env(),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    output = completed.stderr + completed.stdout
+    names = list(dict.fromkeys(re.findall(r'"([^"]+)"\s+\(video\)', output)))
+    index = int(device)
+    if index >= len(names):
+        available = "、".join(names) if names else "未检测到摄像头"
+        raise RuntimeError(f"摄像头索引 {device} 不存在；可用设备：{available}")
+    return names[index]
+
+
+def _camera_input_args(ffmpeg: str, device: str) -> list[str]:
+    """Return FFmpeg input arguments for the active operating system."""
+    system = platform.system()
+    if system == "Darwin":
+        return ["-f", "avfoundation", "-framerate", "30", "-i", f"{device}:none"]
+    if system == "Windows":
+        camera_name = _windows_camera_name(ffmpeg, device)
+        return ["-f", "dshow", "-framerate", "30", "-i", f"video={camera_name}"]
+    if system == "Linux":
+        camera_path = device if device.startswith("/dev/") else f"/dev/video{device}"
+        return ["-f", "v4l2", "-framerate", "30", "-i", camera_path]
+    raise RuntimeError(f"capture_photo 暂不支持当前系统: {system}")
 
 
 def capture_photo(
@@ -439,9 +527,7 @@ def capture_photo(
     allowed_roots: Iterable[str | Path] | None = None,
     approval_callback: ApprovalCallback | None = None,
 ) -> str:
-    """Capture one photo from a macOS camera using FFmpeg AVFoundation."""
-    if os.uname().sysname != "Darwin":
-        raise RuntimeError("capture_photo 当前仅支持 macOS")
+    """Capture one photo with the native FFmpeg camera backend."""
     if warmup_seconds < 0 or warmup_seconds > 10:
         raise ValueError("warmup_seconds 必须在 0 到 10 秒之间")
     output_path = _resolve_workspace_path(
@@ -461,19 +547,14 @@ def capture_photo(
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError("未找到 ffmpeg，无法访问 macOS 摄像头")
+        raise RuntimeError("未找到 ffmpeg，无法访问摄像头")
     command = [
         ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
-        "-f",
-        "avfoundation",
-        "-framerate",
-        "30",
-        "-i",
-        f"{device}:none",
     ]
+    command.extend(_camera_input_args(ffmpeg, device))
     if warmup_seconds > 0:
         command.extend(["-vf", f"select=gte(t\\,{warmup_seconds})"])
     command.extend(["-frames:v", "1", "-y", str(output_path)])

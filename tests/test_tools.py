@@ -1,3 +1,8 @@
+import json
+import platform
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -125,11 +130,12 @@ def test_directory_lifecycle_only_deletes_empty_directory(tmp_path: Path):
 
 
 def test_run_command_requires_approval_and_returns_exit_code(tmp_path: Path):
-    denied = run_command("printf denied", workspace_root=tmp_path)
+    command = _python_command("print('approved')")
+    denied = run_command(command, workspace_root=tmp_path)
     assert "拒绝" in denied
 
     approved = run_command(
-        "printf approved",
+        command,
         workspace_root=tmp_path,
         approval_callback=lambda _command, _cwd: True,
     )
@@ -139,8 +145,12 @@ def test_run_command_requires_approval_and_returns_exit_code(tmp_path: Path):
 
 def test_run_command_does_not_forward_api_keys(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-leak")
+    command = _python_command(
+        "import os,sys; value=os.getenv('DEEPSEEK_API_KEY',''); "
+        "print(value); sys.exit(0 if value else 1)"
+    )
     result = run_command(
-        "printenv DEEPSEEK_API_KEY",
+        command,
         workspace_root=tmp_path,
         approval_callback=lambda _command, _cwd: True,
     )
@@ -153,7 +163,10 @@ def test_mutation_through_symlink_is_rejected(tmp_path: Path):
     outside = tmp_path / "outside"
     workspace.mkdir()
     outside.mkdir()
-    (workspace / "linked").symlink_to(outside, target_is_directory=True)
+    try:
+        (workspace / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("当前 Windows 环境不允许创建符号链接")
 
     with pytest.raises(ValueError, match="符号链接"):
         write_file(
@@ -192,13 +205,11 @@ def test_full_access_handlers_can_reach_outside_and_sensitive_files(tmp_path: Pa
     )
 
     read_result = _execute_tool(
-        "read_file",
-        f'{{"path": "{outside / ".env"}"}}',
-        handlers,
+        "read_file", json.dumps({"path": str(outside / ".env")}), handlers
     )
     write_result = _execute_tool(
         "write_file",
-        f'{{"path": "{outside / "created.txt"}", "content": "ok"}}',
+        json.dumps({"path": str(outside / "created.txt"), "content": "ok"}),
         handlers,
     )
 
@@ -215,6 +226,7 @@ def test_capture_photo_requires_approval(tmp_path: Path):
 
 
 def test_capture_photo_verifies_generated_image(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(tools_module.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(tools_module.shutil, "which", lambda _name: "/opt/homebrew/bin/ffmpeg")
 
     def fake_run(command, **_kwargs):
@@ -230,3 +242,80 @@ def test_capture_photo_verifies_generated_image(tmp_path: Path, monkeypatch):
 
     assert "已拍照并保存" in result
     assert (tmp_path / "photo.jpg").stat().st_size > 100
+
+
+def _python_command(source: str) -> str:
+    arguments = [sys.executable, "-c", source]
+    if platform.system() == "Windows":
+        return "& " + subprocess.list2cmdline(arguments)
+    return shlex.join(arguments)
+
+
+@pytest.mark.parametrize(
+    ("system_name", "expected_backend", "expected_input"),
+    [
+        ("Darwin", "avfoundation", "0:none"),
+        ("Linux", "v4l2", "/dev/video0"),
+        ("Windows", "dshow", "video=Integrated Camera"),
+    ],
+)
+def test_capture_photo_uses_native_camera_backend(
+    tmp_path: Path,
+    monkeypatch,
+    system_name: str,
+    expected_backend: str,
+    expected_input: str,
+):
+    calls = []
+    monkeypatch.setattr(tools_module.platform, "system", lambda: system_name)
+    monkeypatch.setattr(tools_module.shutil, "which", lambda _name: "ffmpeg")
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if "-list_devices" in command:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr='[dshow] "Integrated Camera" (video)\n',
+            )
+        Path(command[-1]).write_bytes(b"photo" * 100)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(tools_module.subprocess, "run", fake_run)
+    result = capture_photo(
+        "native.jpg",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: True,
+    )
+
+    capture_command = calls[-1]
+    assert expected_backend in capture_command
+    assert expected_input in capture_command
+    assert "已拍照并保存" in result
+
+
+def test_run_command_uses_powershell_on_windows(tmp_path: Path, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(tools_module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        tools_module.shutil,
+        "which",
+        lambda name: "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+        if name == "pwsh"
+        else None,
+    )
+
+    def fake_run(command, **_kwargs):
+        recorded.append(command)
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(tools_module.subprocess, "run", fake_run)
+    result = run_command(
+        "Write-Output ok",
+        workspace_root=tmp_path,
+        approval_callback=lambda _command, _cwd: True,
+    )
+
+    assert recorded[0][0].endswith("pwsh.exe")
+    assert "-NoProfile" in recorded[0]
+    assert "退出码: 0" in result

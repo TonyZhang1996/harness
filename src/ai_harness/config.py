@@ -11,6 +11,19 @@ from pathlib import Path
 ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def find_env_file() -> Path | None:
+    """Locate configuration consistently across editable and global installs."""
+    explicit = os.getenv("AI_HARNESS_ENV_FILE")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+
+    candidates = [Path.cwd() / ".env", Path.home() / ".ai-harness" / ".env"]
+    project_root = Path(__file__).resolve().parents[2]
+    if (project_root / "pyproject.toml").is_file():
+        candidates.append(project_root / ".env")
+    return next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+
+
 def load_env_file(path: str | Path, *, override: bool = False) -> None:
     """Load simple KEY=VALUE entries without executing the file as shell code."""
     env_path = Path(path).expanduser().resolve()
@@ -61,7 +74,7 @@ class ModelConfig:
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
-        env_file = os.getenv("AI_HARNESS_ENV_FILE")
+        env_file = find_env_file()
         if env_file:
             load_env_file(env_file)
         api_key = (

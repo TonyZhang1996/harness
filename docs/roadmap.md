@@ -11,6 +11,14 @@
 - External-directory allowlist
 - Tests, documentation, CI, and global launcher
 
+## 0.3 — Cross-platform runtime
+
+- Native PowerShell, zsh, and bash/sh command execution
+- Windows DirectShow, macOS AVFoundation, and Linux V4L2 camera backends
+- Windows drive-aware full-access mode
+- Cross-platform environment-file discovery and module launcher
+- Windows, macOS, and Linux CI matrix
+
 ## Next
 
 - Context compaction and token budgeting
@@ -18,6 +26,6 @@
 - Unified patch application and rollback checkpoints
 - Rich terminal UI
 - Pluggable model providers and routing policies
-- OS/container sandbox backends
+- Stronger OS/container sandbox backends
 - Spreadsheet, document, PDF, image, and browser tool plugins
 - Persistent sessions and resumable tasks

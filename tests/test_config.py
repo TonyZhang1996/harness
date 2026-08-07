@@ -1,6 +1,11 @@
 import pytest
 
-from ai_harness.config import ModelConfig, load_env_file
+from ai_harness.config import ModelConfig, find_env_file, load_env_file
+
+
+@pytest.fixture(autouse=True)
+def disable_real_env_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_HARNESS_ENV_FILE", str(tmp_path / "missing.env"))
 
 
 def test_deepseek_environment_defaults(monkeypatch):
@@ -39,3 +44,20 @@ def test_env_file_is_parsed_without_shell_execution(tmp_path, monkeypatch):
 
     assert ModelConfig.from_env().api_key == "file-key"
     assert ModelConfig.from_env().model == "custom-model"
+
+
+def test_env_file_discovery_prefers_explicit_path(tmp_path, monkeypatch):
+    env_file = tmp_path / "custom.env"
+    env_file.write_text("AI_HARNESS_API_KEY=value", encoding="utf-8")
+    monkeypatch.setenv("AI_HARNESS_ENV_FILE", str(env_file))
+
+    assert find_env_file() == env_file.resolve()
+
+
+def test_env_file_discovery_uses_current_workspace(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("AI_HARNESS_API_KEY=value", encoding="utf-8")
+    monkeypatch.delenv("AI_HARNESS_ENV_FILE")
+    monkeypatch.chdir(tmp_path)
+
+    assert find_env_file() == env_file.resolve()
