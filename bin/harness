@@ -1,0 +1,20 @@
+#!/bin/zsh
+
+set -e
+
+SCRIPT_PATH="${0:A}"
+SCRIPT_DIR="${SCRIPT_PATH:h}"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+HARNESS_BIN="$PROJECT_ROOT/.venv/bin/ai-harness"
+
+if [[ ! -x "$HARNESS_BIN" ]]; then
+  echo "找不到虚拟环境中的 ai-harness: $HARNESS_BIN" >&2
+  echo "请先在项目目录创建并安装 .venv。" >&2
+  exit 1
+fi
+
+if [[ -f "$PROJECT_ROOT/.env" ]]; then
+  export AI_HARNESS_ENV_FILE="$PROJECT_ROOT/.env"
+fi
+
+exec "$HARNESS_BIN" "$@"
