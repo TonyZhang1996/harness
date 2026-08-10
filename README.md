@@ -203,6 +203,12 @@ GUI 每次启动默认使用“帮我批准”，权限下拉框采用深色显�
 
 “模型连接”窗口提供 API Key、API URL 和模型输入框。DeepSeek URL 默认是 `https://api.deepseek.com`，默认模型是 `deepseek-v4-flash`；配置保存在用户目录的 `~/.ai-harness/.env`。
 
+## 0.4.1 修复
+
+- 修复 macOS 上建议卡片文字与背景颜色接近、导致内容显示为白块的问题。
+- GUI 启动时恢复上次使用的工作区和当前 Session。
+- 修复 macOS 应用打包后图标等资源的查找路径。
+
 ## 当前边界
 
-AI Harness 0.4.0 是一个支持 Windows、macOS 和 Linux 的本地编码 Agent MVP，并提供 Tkinter 桌面 GUI。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。
+AI Harness 0.4.1 是一个支持 Windows、macOS 和 Linux 的本地编码 Agent MVP，并提供 Tkinter 桌面 GUI。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。
