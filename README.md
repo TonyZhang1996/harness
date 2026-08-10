@@ -41,7 +41,7 @@ Copy-Item .env.example .env
 
 ```env
 DEEPSEEK_API_KEY="你的 API Key"
-AI_HARNESS_MODEL="deepseek-chat"
+AI_HARNESS_MODEL="deepseek-v4-flash"
 ```
 
 安装完成后，三个系统都使用相同命令：
@@ -94,8 +94,7 @@ Shell 命令审批策略：
 
 ```bash
 harness --approval ask    # 默认，每次询问
-harness --approval auto   # 自动允许，仅用于可信工作区
-harness --approval never  # 完全禁止命令执行
+harness --approval auto   # 帮我批准：独立审查，必要时询问
 ```
 
 完全访问模式：
@@ -104,7 +103,7 @@ harness --approval never  # 完全禁止命令执行
 harness --full-access
 ```
 
-`--full-access` 会允许访问整个文件系统、读取或修改敏感文件，并自动批准 Shell 命令。它等价于主动放弃工作区隔离和逐次审批，只应在可信任务中临时使用。退出该会话后，下次普通运行会恢复默认安全模式。
+`--full-access` 会允许访问整个文件系统、读取或修改敏感文件，并自动批准 Shell 命令。它等价于主动放弃工作区隔离和逐次审批，只应在可信任务中临时使用。退出该会话后，GUI 会恢复默认的“帮我批准”模式，CLI 会恢复“请求批准”模式。
 
 平台后端会自动选择：
 
@@ -120,9 +119,8 @@ harness --full-access
 
 - `/permissions`：打开权限模式菜单
 - `/permissions ask` 或 `/ask`：请求批准；限制在工作区和授权目录，敏感操作逐次询问
-- `/permissions auto` 或 `/auto`：替我审批；仍限制在工作区和授权目录，但自动批准敏感操作
+- `/permissions auto` 或 `/auto`：帮我批准；仍限制在工作区和授权目录，由独立审查器自动允许低风险操作、拒绝明确危险操作，并把不确定操作交给你确认
 - `/permissions full-access` 或 `/full-access`：完全访问整个文件系统、敏感文件并自动批准
-- `/permissions never` 或 `/never`：限制在工作区和授权目录，并拒绝敏感操作
 - `/clear`：清空对话上下文
 - `/help`：显示帮助
 - `/exit` 或 `Ctrl-D`：退出
@@ -144,7 +142,7 @@ DeepSeek：
 
 ```env
 DEEPSEEK_API_KEY="..."
-AI_HARNESS_MODEL="deepseek-chat"
+AI_HARNESS_MODEL="deepseek-v4-flash"
 ```
 
 任意 OpenAI 兼容端点：
@@ -165,7 +163,10 @@ AI_HARNESS_TIMEOUT="60"
 - 文件修改拒绝经过符号链接路径。
 - `delete_file` 不删除目录，`delete_directory` 只删除空目录。
 - Shell 命令默认要求确认，并受工作目录、超时和输出长度限制。
+- “帮我批准”通过独立、窄职责的模型调用审查命令；审查失败时回退到人工确认，绝不静默放行。
+- 本地硬规则会阻止凭据探测、敏感数据外发、关闭安全防护和大范围不可逆删除；“帮我批准”模式下普通网络访问按低风险自动允许，摄像头、安装、删除及系统状态修改仍需人工确认。
 - 摄像头访问与命令执行共用审批策略；完全访问模式会自动允许。
+- Windows 下 PowerShell、Git 和 FFmpeg 等工具子进程使用无控制台窗口方式启动，不会反复弹出黑色终端窗口。
 - Shell 子进程不会继承常见模型 API Key 环境变量。
 - `.env`、私钥和常见证书文件在工具层禁止读取、搜索、覆盖和删除。
 - 只有显式使用 `--full-access` 时，以上文件与命令保护才会在该次会话中解除。
@@ -178,6 +179,30 @@ python -m pytest
 
 架构说明见 [docs/architecture.md](docs/architecture.md)，后续路线见 [docs/roadmap.md](docs/roadmap.md)。
 
+## 0.4.0 桌面 GUI
+
+0.4.0 增加了一个基于 Tkinter 的本地桌面工作台，沿用 Codex 风格的深色三栏布局：左侧是工作区、会话和权限设置，中间是对话与工具活动，底部是任务输入框。GUI 与 CLI 共用同一个 `AgentSession`，不会产生两套工具行为。
+
+启动方式：
+
+```bash
+harness --gui
+# 或
+harness-gui
+# 或
+python -m ai_harness --gui
+```
+
+GUI 以“项目 → Sessions”的树形结构管理任务，支持 Session 新建、切换、删除和本地会话持久化；项目可通过拖曳调整顺序，也可从侧边栏移除（不会删除磁盘文件）。首次问答完成后，模型会生成不超过 11 个字的 Session 标题。输入框按 Enter 发送、Shift+Enter 换行；可以通过“＋附件”选择文件，也可以用 Ctrl+V 直接粘贴剪贴板图片或资源管理器中的文件。
+
+GUI 每次启动默认使用“帮我批准”，权限下拉框采用深色显示，并提供“请求批准”“帮我批准”和“完全访问”三个选项。
+
+图片附件会先由本机 `rapidocr_onnxruntime` 做 OCR 识别，再将识别出的文字发送给文本模型；图片本身不会上传到 OCR 服务。若本机未安装 OCR 依赖，界面会在会话中显示识别失败原因。
+
+“请求批准”模式会在 GUI 内弹出中文的“允许/拒绝”确认窗口，不再等待终端输入。任务运行时发送按钮会变成方形停止按钮；停止完成后显示三角形继续按钮，可从已有上下文继续运行。
+
+“模型连接”窗口提供 API Key、API URL 和模型输入框。DeepSeek URL 默认是 `https://api.deepseek.com`，默认模型是 `deepseek-v4-flash`；配置保存在用户目录的 `~/.ai-harness/.env`。
+
 ## 当前边界
 
-AI Harness 0.3.0 是一个支持 Windows、macOS 和 Linux 的本地编码 Agent MVP。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。
+AI Harness 0.4.0 是一个支持 Windows、macOS 和 Linux 的本地编码 Agent MVP，并提供 Tkinter 桌面 GUI。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。

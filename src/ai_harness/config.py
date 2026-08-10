@@ -93,7 +93,7 @@ class ModelConfig:
 
         model = os.getenv("AI_HARNESS_MODEL")
         if not model:
-            model = "deepseek-chat" if base_url == "https://api.deepseek.com" else ""
+            model = "deepseek-v4-flash" if base_url == "https://api.deepseek.com" else ""
         if not model:
             raise RuntimeError("请设置 AI_HARNESS_MODEL")
 

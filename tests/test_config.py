@@ -17,7 +17,7 @@ def test_deepseek_environment_defaults(monkeypatch):
 
     config = ModelConfig.from_env()
 
-    assert config.model == "deepseek-chat"
+    assert config.model == "deepseek-v4-flash"
     assert config.base_url == "https://api.deepseek.com"
 
 

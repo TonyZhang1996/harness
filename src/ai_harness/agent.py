@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import platform
+import re
+import threading
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any
 
-from .approval import CommandApprover
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except ImportError:  # pragma: no cover - optional runtime fallback
+    RapidOCR = None  # type: ignore[assignment,misc]
+
+from .approval import AutoReviewApprover, CommandApprover
 from .config import ModelConfig
 from .model import create_client
 from .tools import (
@@ -30,6 +38,41 @@ from .tools import (
     search_text,
     write_file,
 )
+
+
+_OCR_ENGINE: Any | None = None
+_OCR_LOCK = threading.Lock()
+
+
+def _extract_image_text(path: Path) -> str:
+    """Extract image text locally so text-only endpoints can process images."""
+    global _OCR_ENGINE
+    if RapidOCR is None:
+        return "本机未安装 rapidocr_onnxruntime，未能识别图片文字。"
+    try:
+        with _OCR_LOCK:
+            if _OCR_ENGINE is None:
+                _OCR_ENGINE = RapidOCR()
+            result, _ = _OCR_ENGINE(str(path))
+        if not result:
+            return "本地 OCR 未识别到文字。"
+        recognized: list[tuple[float, float, str]] = []
+        for item in result:
+            if len(item) < 2:
+                continue
+            box, text = item[0], str(item[1]).strip()
+            if not text:
+                continue
+            try:
+                x = min(float(point[0]) for point in box)
+                y = min(float(point[1]) for point in box)
+            except (TypeError, ValueError, IndexError):
+                x, y = 0.0, float(len(recognized))
+            recognized.append((y, x, text))
+        recognized.sort(key=lambda item: (item[0], item[1]))
+        return "\n".join(item[2] for item in recognized) or "本地 OCR 未识别到文字。"
+    except Exception as exc:  # OCR must not prevent ordinary text requests.
+        return f"本地 OCR 识别失败：{exc}"
 
 
 def _object_schema(
@@ -240,10 +283,15 @@ Do not expose API keys or secrets. Respond in the user's language and summarize 
 EventCallback = Callable[[str, str], None]
 
 
+class AgentPaused(RuntimeError):
+    """Raised when the user stops a running agent turn."""
+
+
 def _handlers_for_workspace(
     workspace: str | Path | None,
     allowed_paths: Sequence[str | Path] | None = None,
     approval_callback: Callable[[str, Path], bool] | None = None,
+    cancel_event: threading.Event | None = None,
     full_access: bool = False,
 ) -> dict[str, Callable[..., str]]:
     """Bind every tool to one workspace, extra roots, and approval policy."""
@@ -262,6 +310,8 @@ def _handlers_for_workspace(
         }
         if name in {"run_command", "capture_photo"}:
             kwargs["approval_callback"] = approval_callback
+        if name == "run_command":
+            kwargs["cancel_event"] = cancel_event
         if name in {
             "read_file",
             "search_text",
@@ -336,6 +386,8 @@ class AgentSession:
         "safe": "ask",
         "auto": "auto",
         "approve": "auto",
+        "review": "auto",
+        "guardian": "auto",
         "never": "never",
         "deny": "never",
         "full": "full-access",
@@ -345,7 +397,7 @@ class AgentSession:
 
     def __init__(
         self,
-        max_turns: int = 12,
+        max_turns: int = 100,
         workspace: str | Path | None = None,
         allowed_paths: Sequence[str | Path] | None = None,
         approval_mode: str = "ask",
@@ -369,9 +421,11 @@ class AgentSession:
         self.allowed_paths = tuple(allowed_paths or ())
         self.full_access = full_access
         self.approval_mode = "auto" if full_access else approval_mode
-        self.approver = approver or CommandApprover(self.approval_mode)
-        self._rebuild_tool_handlers()
+        self.interactive_approver = approver
+        self.stop_event = threading.Event()
         self.messages: list[dict[str, Any]] = []
+        self.approver = self._build_approver()
+        self._rebuild_tool_handlers()
         self.clear()
 
     @property
@@ -384,8 +438,48 @@ class AgentSession:
             self.workspace,
             self.allowed_paths,
             self.approver,
+            self.stop_event,
             full_access=self.full_access,
         )
+
+    def _approval_context(self) -> str:
+        """Return a compact retained transcript for the separate reviewer."""
+        context: list[str] = []
+        for message in self.messages[-12:]:
+            role = str(message.get("role", "unknown"))
+            if role == "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                context.append(f"{role}: {content[:1200]}")
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                names = [
+                    str(call.get("function", {}).get("name", "tool"))
+                    for call in tool_calls
+                    if isinstance(call, dict)
+                ]
+                if names:
+                    context.append(f"{role} requested tools: {', '.join(names)}")
+        return "\n".join(context)[-5000:]
+
+    def _build_approver(self) -> Callable[[str, Path], bool]:
+        """Build the active approver without changing filesystem boundaries."""
+        if self.full_access:
+            return CommandApprover("auto")
+        if self.approval_mode == "ask":
+            return self.interactive_approver or CommandApprover("ask")
+        if self.approval_mode == "auto":
+            return AutoReviewApprover(
+                self.client,
+                self.model_name,
+                fallback_approver=(
+                    self.interactive_approver or CommandApprover("ask")
+                ),
+                context_provider=self._approval_context,
+                event_callback=self._emit,
+            )
+        return CommandApprover("never")
 
     def set_permission_mode(self, mode: str) -> str:
         """Switch file boundaries and action approval policy for this session."""
@@ -397,7 +491,7 @@ class AgentSession:
 
         self.full_access = normalized == "full-access"
         self.approval_mode = "auto" if self.full_access else normalized
-        self.approver = CommandApprover(self.approval_mode)
+        self.approver = self._build_approver()
         self._rebuild_tool_handlers()
         if self.messages:
             self.messages[0]["content"] = self._system_prompt()
@@ -417,7 +511,12 @@ class AgentSession:
         else:
             approval_context = {
                 "ask": "Potentially sensitive tool actions require user approval.",
-                "auto": "Potentially sensitive tool actions are automatically approved.",
+                "auto": (
+                    "Potentially sensitive tool actions are routed to a separate approval "
+                    "reviewer. Low-risk actions may be allowed, high-risk actions may be "
+                    "denied, and ambiguous actions require user confirmation. Review does "
+                    "not expand filesystem or network permissions."
+                ),
                 "never": "Potentially sensitive tool actions are denied.",
             }[self.approval_mode]
             permission_context = (
@@ -436,27 +535,113 @@ class AgentSession:
             self.event_callback(kind, message)
 
     def clear(self) -> None:
+        self.stop_event.clear()
         self.messages = [{"role": "system", "content": self._system_prompt()}]
 
-    def ask(self, task: str) -> str:
-        if not task.strip():
+    def request_stop(self) -> None:
+        """Request cooperative cancellation of the active turn."""
+        self.stop_event.set()
+
+    def _raise_if_stopped(self) -> None:
+        if self.stop_event.is_set():
+            raise AgentPaused("运行已由用户停止")
+
+    def _append_cancelled_tool_results(self, tool_calls: Sequence[Any]) -> None:
+        for tool_call in tool_calls:
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": "用户已停止运行，工具未执行。",
+                }
+            )
+
+    @staticmethod
+    def _user_content(
+        task: str,
+        attachments: Sequence[str | Path] | None = None,
+    ) -> str | list[dict[str, Any]]:
+        """Build an OpenAI-compatible user message with local attachments."""
+        paths = [Path(item).expanduser().resolve() for item in attachments or ()]
+        if not paths:
+            return task
+
+        text_parts = [task, "\n\n用户随消息附加了以下文件："]
+        text_suffixes = {
+            ".txt", ".md", ".py", ".js", ".ts", ".tsx", ".jsx", ".json",
+            ".toml", ".yaml", ".yml", ".xml", ".html", ".css", ".csv",
+            ".log", ".ini", ".cfg", ".sql", ".ps1", ".sh",
+        }
+        for path in paths:
+            if not path.is_file():
+                text_parts.append(f"\n- {path.name}（文件不存在或不可读取）")
+                continue
+            mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            size = path.stat().st_size
+            if mime_type.startswith("image/") and path.suffix.lower() in {
+                ".png", ".jpg", ".jpeg", ".gif", ".webp",
+            }:
+                if size > 20_000_000:
+                    text_parts.append(f"\n- {path.name}（图片超过 20 MB，未发送内容）")
+                    continue
+                ocr_text = _extract_image_text(path)
+                text_parts.append(
+                    f"\n\n--- 图片 OCR：{path.name}（{size} bytes）---\n"
+                    f"{ocr_text}\n--- 图片 OCR 结束 ---"
+                )
+                continue
+            if mime_type.startswith("text/") or path.suffix.lower() in text_suffixes:
+                try:
+                    content = path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                if len(content) > 100_000:
+                    content = content[:100_000] + "\n[附件内容已截断]"
+                text_parts.append(
+                    f"\n\n--- 附件 {path.name} ---\n{content}\n--- 附件结束 ---"
+                )
+            else:
+                text_parts.append(
+                    f"\n- 文件：{path.name}（{mime_type}，{size} bytes；二进制内容未内联）"
+                )
+
+        rendered_text = "".join(text_parts)
+        return rendered_text
+
+    def ask(
+        self,
+        task: str,
+        attachments: Sequence[str | Path] | None = None,
+        *,
+        resume: bool = False,
+    ) -> str:
+        if not resume and not task.strip():
             return ""
-        self.messages.append({"role": "user", "content": task})
+        self.stop_event.clear()
+        if not resume:
+            self.messages.append(
+                {"role": "user", "content": self._user_content(task, attachments)}
+            )
 
         for _ in range(self.max_turns):
+            self._raise_if_stopped()
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=self.messages,
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
             )
+            self._raise_if_stopped()
             message = response.choices[0].message
             tool_calls = message.tool_calls or []
             self.messages.append(_assistant_message_to_dict(message))
             if not tool_calls:
                 return message.content or ""
 
-            for tool_call in tool_calls:
+            for index, tool_call in enumerate(tool_calls):
+                if self.stop_event.is_set():
+                    self._append_cancelled_tool_results(tool_calls[index:])
+                    self._raise_if_stopped()
                 summary = _safe_tool_summary(
                     tool_call.function.name, tool_call.function.arguments
                 )
@@ -474,12 +659,61 @@ class AgentSession:
                         "content": result,
                     }
                 )
+                if self.stop_event.is_set():
+                    self._append_cancelled_tool_results(tool_calls[index + 1 :])
+                    self._raise_if_stopped()
         raise RuntimeError("Agent 达到最大循环次数，任务未完成")
+
+    def resume(self) -> str:
+        """Continue a previously stopped turn without duplicating the user message."""
+        return self.ask("", resume=True)
+
+    @staticmethod
+    def _normalize_session_title(raw_title: str, max_chars: int = 11) -> str:
+        """Normalize a model-generated title to one compact line."""
+        title = raw_title.strip().splitlines()[0] if raw_title.strip() else ""
+        title = title.strip(" \t\r\n\"'“”‘’《》【】[]")
+        title = re.sub(r"^(?:标题|会话标题|Session\s*标题)\s*[:：]\s*", "", title, flags=re.I)
+        title = title.strip(" \t\r\n\"'“”‘’《》【】[]")
+        title = re.sub(r"\s+", "", title)
+        title = re.sub(r"[。！？!?，,；;：:]+$", "", title)
+        return title[:max_chars] if title else "新任务"
+
+    def generate_session_title(
+        self,
+        question: str,
+        answer: str,
+        max_chars: int = 11,
+    ) -> str:
+        """Generate a short title from the completed first question and answer."""
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是会话标题生成器。根据用户问题和助手回答概括核心任务。"
+                        f"只输出一个不超过{max_chars}个汉字的中文标题，不要引号、标点、前缀或解释。"
+                        "标题必须体现问题与回答的共同主题，不能原样复制整句问题。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"用户问题：\n{question[:3000]}\n\n"
+                        f"助手回答：\n{answer[:5000]}"
+                    ),
+                },
+            ],
+            temperature=0,
+        )
+        content = response.choices[0].message.content or ""
+        return self._normalize_session_title(content, max_chars=max_chars)
 
 
 def run_agent(
     task: str,
-    max_turns: int = 12,
+    max_turns: int = 100,
     workspace: str | Path | None = None,
     allowed_paths: Sequence[str | Path] | None = None,
     approval_mode: str = "ask",

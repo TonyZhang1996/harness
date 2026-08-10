@@ -8,6 +8,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
+import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -406,6 +408,22 @@ def _clean_subprocess_env() -> dict[str, str]:
     return environment
 
 
+def _hidden_subprocess_kwargs() -> dict[str, object]:
+    """Prevent tool subprocesses from flashing console windows on Windows."""
+    if platform.system() != "Windows":
+        return {}
+    kwargs: dict[str, object] = {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+    startupinfo_class = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_class is not None:
+        startupinfo = startupinfo_class()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 def _shell_invocation(command: str) -> list[str]:
     """Build a native shell invocation for Windows, macOS, or Linux."""
     system = platform.system()
@@ -443,6 +461,7 @@ def run_command(
     workspace_root: str | Path | None = None,
     allowed_roots: Iterable[str | Path] | None = None,
     approval_callback: ApprovalCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Run a shell command after approval, without forwarding model API keys."""
     if not command.strip():
@@ -461,27 +480,50 @@ def run_command(
         raise NotADirectoryError(f"命令目录不存在: {cwd}")
     if approval_callback is None or not approval_callback(command, command_cwd):
         return "命令执行被用户或审批策略拒绝"
+    if cancel_event is not None and cancel_event.is_set():
+        return "命令执行已由用户停止"
 
     invocation = _shell_invocation(command)
-    try:
-        completed = subprocess.run(
-            invocation,
-            cwd=command_cwd,
-            env=_clean_subprocess_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
-        return f"命令超时（{timeout}s）\n{output[:max_chars]}"
+    process = subprocess.Popen(
+        invocation,
+        cwd=command_cwd,
+        env=_clean_subprocess_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **_hidden_subprocess_kwargs(),
+    )
+    deadline = time.monotonic() + timeout
+    stopped = False
+    timed_out = False
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.15)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event is not None and cancel_event.is_set():
+                stopped = True
+            elif time.monotonic() >= deadline:
+                timed_out = True
+            else:
+                continue
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            break
 
-    output = completed.stdout + completed.stderr
+    output = stdout + stderr
+    if stopped:
+        return f"命令执行已由用户停止\n{output[:max_chars]}".rstrip()
+    if timed_out:
+        return f"命令超时（{timeout}s）\n{output[:max_chars]}".rstrip()
     if len(output) > max_chars:
         output = output[:max_chars] + "\n[命令输出已截断]"
     rendered = _render_command(invocation)
-    return f"命令: {rendered}\n退出码: {completed.returncode}\n{output}".rstrip()
+    return f"命令: {rendered}\n退出码: {process.returncode}\n{output}".rstrip()
 
 
 def _windows_camera_name(ffmpeg: str, device: str) -> str:
@@ -495,6 +537,7 @@ def _windows_camera_name(ffmpeg: str, device: str) -> str:
         text=True,
         timeout=15,
         check=False,
+        **_hidden_subprocess_kwargs(),
     )
     output = completed.stderr + completed.stdout
     names = list(dict.fromkeys(re.findall(r'"([^"]+)"\s+\(video\)', output)))
@@ -568,6 +611,7 @@ def capture_photo(
             text=True,
             timeout=max(15, int(warmup_seconds) + 10),
             check=False,
+            **_hidden_subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("摄像头拍照超时，请检查系统相机权限") from exc
@@ -599,6 +643,7 @@ def git_status(
         text=True,
         timeout=30,
         check=False,
+        **_hidden_subprocess_kwargs(),
     )
     return (completed.stdout + completed.stderr).strip() or "[无状态输出]"
 
@@ -624,6 +669,7 @@ def git_diff(
         text=True,
         timeout=30,
         check=False,
+        **_hidden_subprocess_kwargs(),
     )
     output = completed.stdout + completed.stderr
     if len(output) > max_chars:
