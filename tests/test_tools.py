@@ -296,6 +296,7 @@ def test_capture_photo_uses_native_camera_backend(
 
 def test_run_command_uses_powershell_on_windows(tmp_path: Path, monkeypatch):
     recorded = []
+    recorded_kwargs = []
     monkeypatch.setattr(tools_module.platform, "system", lambda: "Windows")
     monkeypatch.setattr(
         tools_module.shutil,
@@ -305,11 +306,24 @@ def test_run_command_uses_powershell_on_windows(tmp_path: Path, monkeypatch):
         else None,
     )
 
-    def fake_run(command, **_kwargs):
-        recorded.append(command)
-        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+    class FakeProcess:
+        returncode = 0
 
-    monkeypatch.setattr(tools_module.subprocess, "run", fake_run)
+        def communicate(self, timeout=None):
+            return "ok\n", ""
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    def fake_popen(command, **kwargs):
+        recorded.append(command)
+        recorded_kwargs.append(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(tools_module.subprocess, "Popen", fake_popen)
     result = run_command(
         "Write-Output ok",
         workspace_root=tmp_path,
@@ -318,4 +332,6 @@ def test_run_command_uses_powershell_on_windows(tmp_path: Path, monkeypatch):
 
     assert recorded[0][0].endswith("pwsh.exe")
     assert "-NoProfile" in recorded[0]
+    assert recorded_kwargs[0]["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert recorded_kwargs[0]["startupinfo"].wShowWindow == subprocess.SW_HIDE
     assert "退出码: 0" in result

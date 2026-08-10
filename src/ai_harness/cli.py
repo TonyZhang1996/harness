@@ -32,14 +32,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=12,
-        help="每条用户消息最多执行多少轮模型调用（默认：12）。",
+        default=100,
+        help="每条用户消息最多执行多少轮模型调用（默认：100）。",
     )
     parser.add_argument(
         "--approval",
-        choices=["ask", "auto", "never"],
-        default="ask",
-        help="Shell 命令审批策略：询问、自动允许或始终拒绝。",
+        choices=["ask", "auto"],
+        default=None,
+        help="Shell 命令审批策略：请求批准或帮我批准。GUI 默认帮我批准。",
     )
     parser.add_argument(
         "--full-access",
@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", help="指定包含模型配置的 .env 文件。")
     parser.add_argument("--quiet-tools", action="store_true", help="隐藏工具进度。")
     parser.add_argument("--log-file", help="将工具事件以 JSONL 写入指定文件。")
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="启动 Tkinter 桌面界面。",
+    )
     return parser
 
 
@@ -58,9 +63,8 @@ def _print_interactive_help() -> None:
         "交互命令：\n"
         "  /permissions              打开权限模式菜单\n"
         "  /permissions ask         请求批准（默认安全模式）\n"
-        "  /permissions auto        替我审批（仍限制在授权目录）\n"
+        "  /permissions auto        帮我批准（独立审查，仍限制在授权目录）\n"
         "  /permissions full-access 完全访问权限\n"
-        "  /permissions never       禁止执行需审批的操作\n"
         "  /ask /auto /full-access  快速切换权限模式\n"
         "  /clear                    清空当前对话上下文\n"
         "  /help                     显示这份帮助\n"
@@ -71,8 +75,7 @@ def _print_interactive_help() -> None:
 
 PERMISSION_LABELS = {
     "ask": "请求批准",
-    "auto": "替我审批",
-    "never": "禁止执行",
+    "auto": "帮我批准",
     "full-access": "完全访问权限",
 }
 
@@ -84,11 +87,9 @@ def _print_permission_status(session: AgentSession) -> None:
     if mode == "full-access":
         print("⚠ 当前会话可访问整个文件系统和敏感文件，并会自动批准工具操作。")
     elif mode == "auto":
-        print("文件访问仍限制在工作区和授权目录；工具操作将自动批准。")
+        print("文件访问仍限制在工作区和授权目录；敏感操作交给独立审查器，必要时询问你。")
     elif mode == "ask":
         print("文件访问限制在工作区和授权目录；敏感工具操作会逐次询问。")
-    else:
-        print("文件访问限制在工作区和授权目录；敏感工具操作将被拒绝。")
 
 
 def _select_permission_mode(session: AgentSession) -> None:
@@ -96,16 +97,15 @@ def _select_permission_mode(session: AgentSession) -> None:
     print(
         f"当前权限：{PERMISSION_LABELS[current]}（{current}）\n"
         "  1. 请求批准      工作区内操作，敏感操作逐次询问\n"
-        "  2. 替我审批      工作区内操作，敏感操作自动批准\n"
-        "  3. 完全访问权限  整个文件系统、敏感文件、自动批准\n"
-        "  4. 禁止执行      工作区内操作，拒绝敏感操作"
+        "  2. 帮我批准      工作区内操作，由独立审查器允许、拒绝或转交你确认\n"
+        "  3. 完全访问权限  整个文件系统、敏感文件、自动批准"
     )
     try:
-        choice = input("选择 [1-4，回车取消]: ").strip()
+        choice = input("选择 [1-3，回车取消]: ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n已取消权限切换。")
         return
-    selected = {"1": "ask", "2": "auto", "3": "full-access", "4": "never"}.get(choice)
+    selected = {"1": "ask", "2": "auto", "3": "full-access"}.get(choice)
     if not choice:
         print("已取消权限切换。")
         return
@@ -121,7 +121,6 @@ def _handle_permission_command(session: AgentSession, task: str) -> bool:
         "/ask": "ask",
         "/safe": "ask",
         "/auto": "auto",
-        "/never": "never",
         "/full": "full-access",
         "/full-access": "full-access",
     }
@@ -137,7 +136,10 @@ def _handle_permission_command(session: AgentSession, task: str) -> bool:
         _select_permission_mode(session)
         return True
     if len(parts) > 2:
-        print("用法：/permissions [ask|auto|never|full-access]")
+        print("用法：/permissions [ask|auto|full-access]")
+        return True
+    if parts[1] not in {"ask", "auto", "full-access"}:
+        print("无效权限模式；可选值：ask、auto、full-access")
         return True
     try:
         session.set_permission_mode(parts[1])
@@ -194,7 +196,7 @@ def _create_session(
 
 
 def run_interactive(
-    max_turns: int = 12,
+    max_turns: int = 100,
     workspace: str | Path | None = None,
     allowed_paths: list[str] | None = None,
     approval_mode: str = "ask",
@@ -264,12 +266,24 @@ def main() -> None:
             os.environ["AI_HARNESS_ENV_FILE"] = str(
                 Path(args.env_file).expanduser().resolve()
             )
+        approval_mode = args.approval or ("auto" if args.gui else "ask")
+        if args.gui:
+            from .gui import launch_gui
+
+            launch_gui(
+                workspace=args.workspace,
+                approval_mode=approval_mode,
+                full_access=args.full_access,
+                model_name=args.model,
+                max_turns=args.max_turns,
+            )
+            return
         if args.task:
             session = _create_session(
                 max_turns=args.max_turns,
                 workspace=args.workspace,
                 allowed_paths=args.allowed_paths,
-                approval_mode=args.approval,
+                approval_mode=approval_mode,
                 full_access=args.full_access,
                 model_name=args.model,
                 quiet_tools=args.quiet_tools,
@@ -281,7 +295,7 @@ def main() -> None:
                 max_turns=args.max_turns,
                 workspace=args.workspace,
                 allowed_paths=args.allowed_paths,
-                approval_mode=args.approval,
+                approval_mode=approval_mode,
                 full_access=args.full_access,
                 model_name=args.model,
                 quiet_tools=args.quiet_tools,
