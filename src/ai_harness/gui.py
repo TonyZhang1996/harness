@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import queue
+import sys
 import threading
 import tkinter as tk
 import traceback
@@ -59,8 +60,17 @@ UI_FONT = "Microsoft YaHei UI" if platform.system() == "Windows" else "TkDefault
 
 def _app_asset_path(filename: str) -> Path | None:
     """Return a bundled application asset from the project checkout."""
-    asset_path = Path(__file__).resolve().parents[2] / "assets" / filename
-    return asset_path if asset_path.is_file() else None
+    candidates: list[Path] = []
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        candidates.append(Path(bundle_root) / "assets" / filename)
+    candidates.extend(
+        [
+            Path(__file__).resolve().parent / "assets" / filename,
+            Path(__file__).resolve().parents[2] / "assets" / filename,
+        ]
+    )
+    return next((path for path in candidates if path.is_file()), None)
 
 
 def _set_windows_app_user_model_id() -> None:
@@ -104,6 +114,7 @@ class HarnessGUI:
         config_path: str | Path | None = None,
     ) -> None:
         self.root = root
+        self._workspace_was_explicit = workspace is not None
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         if not full_access and approval_mode not in PERMISSION_LABELS:
             approval_mode = "auto"
@@ -235,13 +246,10 @@ class HarnessGUI:
                 if not any(item["path"] == path for item in self.projects):
                     self.projects.append({"name": project.get("name") or Path(path).name, "path": path})
 
-        current_path = str(self.workspace)
-        if not any(project["path"] == current_path for project in self.projects):
-            self.projects.insert(0, {"name": self.workspace.name or current_path, "path": current_path})
-
         for record in state.get("sessions", []):
             if not isinstance(record, dict) or not record.get("id") or not record.get("workspace"):
                 continue
+            record["workspace"] = str(Path(record["workspace"]).expanduser().resolve())
             record.setdefault("title", "未命名任务")
             record.setdefault("items", [])
             record.setdefault("messages", [])
@@ -250,6 +258,17 @@ class HarnessGUI:
             self.sessions.append(record)
 
         preferred_id = state.get("current_session_id", "")
+        preferred = next(
+            (item for item in self.sessions if item["id"] == preferred_id),
+            None,
+        )
+        if preferred is not None and not self._workspace_was_explicit:
+            self.workspace = Path(preferred["workspace"]).expanduser().resolve()
+
+        current_path = str(self.workspace)
+        if not any(project["path"] == current_path for project in self.projects):
+            self.projects.insert(0, {"name": self.workspace.name or current_path, "path": current_path})
+
         matching = [item for item in self.sessions if item["workspace"] == current_path]
         if any(item["id"] == preferred_id for item in matching):
             self.current_session_id = preferred_id
@@ -328,6 +347,27 @@ class HarnessGUI:
             padding=(10, 7),
         )
         style.map("Ghost.TButton", background=[("active", COLORS["panel_hover"])])
+        style.configure(
+            "Suggestion.TButton",
+            background=COLORS["panel"],
+            foreground=COLORS["text"],
+            borderwidth=0,
+            focusthickness=0,
+            anchor="w",
+            padding=(14, 12),
+            font=(UI_FONT, 9),
+        )
+        style.map(
+            "Suggestion.TButton",
+            background=[
+                ("active", COLORS["panel_hover"]),
+                ("pressed", COLORS["panel_hover"]),
+            ],
+            foreground=[
+                ("active", COLORS["text"]),
+                ("pressed", COLORS["text"]),
+            ],
+        )
         style.configure(
             "Icon.TButton",
             background=COLORS["sidebar"],
@@ -1072,21 +1112,11 @@ class HarnessGUI:
         for icon, title, task in suggestions:
             card = tk.Frame(row, bg=COLORS["panel"], highlightthickness=1, highlightbackground=COLORS["border"])
             card.pack(side="left", fill="x", expand=True, padx=(0, 10))
-            button = tk.Button(
+            button = ttk.Button(
                 card,
                 text=f"{icon}  {title}\n{task}",
                 command=lambda value=task: self._use_suggestion(value),
-                bg=COLORS["panel"],
-                fg=COLORS["text"],
-                activebackground=COLORS["panel_hover"],
-                activeforeground=COLORS["text"],
-                justify="left",
-                anchor="w",
-                relief="flat",
-                borderwidth=0,
-                padx=14,
-                pady=12,
-                font=(UI_FONT, 9),
+                style="Suggestion.TButton",
             )
             button.pack(fill="both", expand=True)
 

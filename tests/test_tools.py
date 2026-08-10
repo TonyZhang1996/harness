@@ -332,6 +332,9 @@ def test_run_command_uses_powershell_on_windows(tmp_path: Path, monkeypatch):
 
     assert recorded[0][0].endswith("pwsh.exe")
     assert "-NoProfile" in recorded[0]
-    assert recorded_kwargs[0]["creationflags"] == subprocess.CREATE_NO_WINDOW
-    assert recorded_kwargs[0]["startupinfo"].wShowWindow == subprocess.SW_HIDE
+    assert recorded_kwargs[0]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if hasattr(subprocess, "STARTUPINFO"):
+        assert recorded_kwargs[0]["startupinfo"].wShowWindow == subprocess.SW_HIDE
+    else:
+        assert "startupinfo" not in recorded_kwargs[0]
     assert "退出码: 0" in result
