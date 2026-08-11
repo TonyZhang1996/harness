@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import platform
 import queue
@@ -56,6 +57,26 @@ PERMISSION_LABELS = {
 }
 
 UI_FONT = "Microsoft YaHei UI" if platform.system() == "Windows" else "TkDefaultFont"
+MAX_RENDERED_HISTORY_ITEMS = 80
+
+
+def _mousewheel_units(event: Any) -> int:
+    """Normalize Tk mouse-wheel events across macOS, Windows, and X11."""
+    delta = getattr(event, "delta", 0) or 0
+    if delta:
+        # Tk on macOS commonly reports +/-1, while Windows reports multiples
+        # of 120. Preserve the direction and make both usable as scroll units.
+        if platform.system() == "Darwin":
+            return -1 if delta > 0 else 1
+        magnitude = max(1, abs(int(delta)) // 120)
+        return -magnitude if delta > 0 else magnitude
+
+    button = getattr(event, "num", None)
+    if button == 4:
+        return -1
+    if button == 5:
+        return 1
+    return 0
 
 
 def _app_asset_path(filename: str) -> Path | None:
@@ -96,6 +117,90 @@ def _enable_windows_dpi_awareness() -> None:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except (AttributeError, OSError):
             pass
+
+
+def _tk_resource_pairs() -> list[tuple[Path, Path]]:
+    """Return likely Tcl/Tk script directories for source and bundled runs."""
+    pairs: list[tuple[Path, Path]] = []
+
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        root = Path(bundle_root)
+        pairs.append((root / "_tcl_data", root / "_tk_data"))
+
+    base_prefix = Path(sys.base_prefix)
+    prefixes = [base_prefix, Path(sys.prefix)]
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    prefixes.extend(
+        candidate
+        for candidate in base_prefix.parent.glob(f"cpython-{version}*/")
+        if candidate != base_prefix
+    )
+
+    for prefix in prefixes:
+        for version_name in ("9.0", "8.6"):
+            pairs.append(
+                (
+                    prefix / "lib" / f"tcl{version_name}",
+                    prefix / "lib" / f"tk{version_name}",
+                )
+            )
+
+        # python.org macOS builds keep Tcl/Tk in framework resources.
+        for tcl_scripts in (prefix / "Frameworks").glob(
+            "Tcl.framework/Versions/*/Resources/Scripts"
+        ):
+            version_dir = tcl_scripts.parent.parent
+            tk_scripts = (
+                prefix
+                / "Frameworks"
+                / "Tk.framework"
+                / "Versions"
+                / version_dir.name
+                / "Resources"
+                / "Scripts"
+            )
+            pairs.append((tcl_scripts, tk_scripts))
+
+    return pairs
+
+
+def _configure_tk_runtime() -> None:
+    """Point Tk at resources that PyInstaller or uv may keep outside the venv."""
+    current_tcl = Path(os.environ["TCL_LIBRARY"]) if os.environ.get("TCL_LIBRARY") else None
+    current_tk = Path(os.environ["TK_LIBRARY"]) if os.environ.get("TK_LIBRARY") else None
+    if current_tcl is not None and current_tk is not None:
+        if (current_tcl / "init.tcl").is_file() and (current_tk / "tk.tcl").is_file():
+            return
+
+    for tcl_dir, tk_dir in _tk_resource_pairs():
+        if (tcl_dir / "init.tcl").is_file() and (tk_dir / "tk.tcl").is_file():
+            os.environ["TCL_LIBRARY"] = str(tcl_dir)
+            os.environ["TK_LIBRARY"] = str(tk_dir)
+            return
+
+
+def _set_tk_scaling(root: tk.Tk) -> None:
+    """Apply DPI scaling only when Tk reports a finite screen size."""
+    try:
+        pixels_per_inch = float(root.winfo_fpixels("1i"))
+        if math.isfinite(pixels_per_inch) and pixels_per_inch > 0:
+            root.tk.call("tk", "scaling", pixels_per_inch / 72.0)
+    except (TypeError, ValueError, tk.TclError):
+        # A headless or partially initialized Tk must keep its default scaling.
+        pass
+
+
+def _write_startup_error(error_text: str) -> None:
+    """Persist pre-window startup failures that Tk cannot display itself."""
+    try:
+        log_path = Path.home() / ".ai-harness" / "gui-startup-error.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}]\n{error_text.rstrip()}\n\n")
+    except OSError:
+        pass
 
 
 class HarnessGUI:
@@ -140,14 +245,11 @@ class HarnessGUI:
         ).expanduser().resolve()
         self.attachments_dir = self.state_path.parent / "attachments"
         self.pending_attachments: list[Path] = []
-        self.session: AgentSession | None = None
+        # session_id -> runtime state, so every Session can run concurrently.
+        self.runtimes: dict[str, dict[str, Any]] = {}
         self.event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self.busy = False
-        self.paused = False
-        self.stop_pending = False
-        self.worker_thread: threading.Thread | None = None
+        self.approval_queue: list[dict[str, Any]] = []
         self.active_approval: dict[str, Any] | None = None
-        self.pending_review_message = ""
         self.closing = False
         self.projects: list[dict[str, str]] = []
         self.sessions: list[dict[str, Any]] = []
@@ -158,6 +260,9 @@ class HarnessGUI:
         self._drag_start_y = 0
         self._drag_moved = False
         self._drop_project_path = ""
+        self._body_labels: list[tk.Label] = []
+        self._active_tool_cards: dict[str, dict[str, Any]] = {}
+        self._wrap_refresh_scheduled = False
 
         self._load_state()
         self.root.title(f"AI Harness {__version__} · 张杰")
@@ -178,13 +283,13 @@ class HarnessGUI:
         self.root.minsize(1080, 680)
         self.root.configure(bg=COLORS["app"])
         self.root.report_callback_exception = self._report_callback_exception
-        try:
-            self.root.tk.call("tk", "scaling", self.root.winfo_fpixels("1i") / 72.0)
-        except tk.TclError:
-            pass
+        _set_tk_scaling(self.root)
         self.root.option_add("*Font", (UI_FONT, 9))
         self._configure_styles()
         self._build_layout()
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._on_mousewheel, add="+")
         self._refresh_project_list()
         self._refresh_session_list()
         self._render_current_session()
@@ -231,6 +336,38 @@ class HarnessGUI:
             "items": [],
             "messages": [],
         }
+
+    @staticmethod
+    def _new_runtime() -> dict[str, Any]:
+        return {
+            "session": None,
+            "worker": None,
+            "busy": False,
+            "paused": False,
+            "stop_pending": False,
+            "active_approval": None,
+            "pending_review_message": "",
+            "progress": "",
+        }
+
+    def _runtime(self, session_id: str) -> dict[str, Any]:
+        runtime = self.runtimes.get(session_id)
+        if runtime is None:
+            runtime = self._new_runtime()
+            self.runtimes[session_id] = runtime
+        return runtime
+
+    def _active_runtime(self) -> dict[str, Any]:
+        return self._runtime(self.current_session_id)
+
+    def _session_record(self, session_id: str) -> dict[str, Any]:
+        for record in self.sessions:
+            if record["id"] == session_id:
+                return record
+        record = self._new_session_record()
+        record["id"] = session_id
+        self.sessions.append(record)
+        return record
 
     def _load_state(self) -> None:
         state: dict[str, Any] = {}
@@ -297,17 +434,19 @@ class HarnessGUI:
             pass
 
     def _current_record(self) -> dict[str, Any]:
-        for record in self.sessions:
-            if record["id"] == self.current_session_id:
-                return record
-        record = self._new_session_record()
-        self.sessions.append(record)
-        self.current_session_id = record["id"]
-        return record
+        return self._session_record(self.current_session_id)
 
     def _snapshot_agent_messages(self) -> None:
-        if self.session is not None and self.current_session_id:
-            self._current_record()["messages"] = self.session.messages[1:]
+        for session_id, runtime in self.runtimes.items():
+            session = runtime["session"]
+            if session is None:
+                continue
+            record = next(
+                (item for item in self.sessions if item["id"] == session_id),
+                None,
+            )
+            if record is not None:
+                record["messages"] = session.messages[1:]
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -480,7 +619,12 @@ class HarnessGUI:
         tree_scroll.pack(side="right", fill="y")
         self.project_tree.pack(side="left", fill="both", expand=True)
         self.project_tree.bind("<<TreeviewSelect>>", self._select_tree_item)
+        # Tk reports a macOS secondary click as Button-2 or Button-3
+        # depending on the pointing device; Control-click is the fallback.
+        self.project_tree.bind("<Button-2>", self._show_tree_context_menu)
         self.project_tree.bind("<Button-3>", self._show_tree_context_menu)
+        if platform.system() == "Darwin":
+            self.project_tree.bind("<Control-Button-1>", self._show_tree_context_menu)
         self.project_tree.bind("<Delete>", lambda _event: self.delete_selected_tree_item())
         self.project_tree.bind("<ButtonPress-1>", self._start_project_drag)
         self.project_tree.bind("<B1-Motion>", self._drag_project)
@@ -584,8 +728,12 @@ class HarnessGUI:
         self.chat_inner = tk.Frame(self.chat_canvas, bg=COLORS["app"])
         self.chat_window = self.chat_canvas.create_window((0, 0), window=self.chat_inner, anchor="nw")
         self.chat_inner.bind("<Configure>", lambda _event: self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all")))
-        self.chat_canvas.bind("<Configure>", lambda event: self.chat_canvas.itemconfigure(self.chat_window, width=event.width))
-        self.chat_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.chat_canvas.bind("<Configure>", self._on_chat_canvas_configure)
+
+    def _on_chat_canvas_configure(self, event: tk.Event[Any]) -> None:
+        """Keep the chat content width and card wrapping in sync with resizing."""
+        self.chat_canvas.itemconfigure(self.chat_window, width=event.width)
+        self._schedule_card_wrap_refresh()
 
     def _build_composer(self, parent: ttk.Frame) -> None:
         composer_wrap = tk.Frame(parent, bg=COLORS["app"])
@@ -727,9 +875,25 @@ class HarnessGUI:
                 font=(UI_FONT, 8),
             ).pack(side="left", padx=4)
 
-    def _on_mousewheel(self, event: tk.Event[Any]) -> None:
-        if self.chat_canvas.winfo_containing(event.x_root, event.y_root):
-            self.chat_canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+    @staticmethod
+    def _widget_is_inside(widget: tk.Misc, container: tk.Misc) -> bool:
+        """Return whether a Tk widget is the container or one of its children."""
+        widget_path = str(widget)
+        container_path = str(container)
+        return widget_path == container_path or widget_path.startswith(container_path + ".")
+
+    def _on_mousewheel(self, event: tk.Event[Any]) -> str | None:
+        units = _mousewheel_units(event)
+        if not units:
+            return None
+        widget = getattr(event, "widget", None)
+        if widget is not None and self._widget_is_inside(widget, self.chat_canvas):
+            self.chat_canvas.yview_scroll(units, "units")
+            return "break"
+        if widget is not None and self._widget_is_inside(widget, self.project_tree):
+            self.project_tree.yview_scroll(units, "units")
+            return "break"
+        return None
 
     def _refresh_project_list(self) -> None:
         self._refresh_project_tree()
@@ -792,7 +956,7 @@ class HarnessGUI:
         if item_id.startswith("project-"):
             project_path = self._project_path_from_item(item_id)
             self.tree_context_menu.add_command(
-                label="移除项目",
+                label="移除项目（不删除磁盘文件）",
                 command=lambda path=project_path: self._remove_project(path),
             )
         elif item_id.startswith("session-"):
@@ -808,13 +972,6 @@ class HarnessGUI:
 
     def delete_selected_tree_item(self) -> None:
         """Delete the selected Session or remove a project from the sidebar."""
-        if self.busy:
-            messagebox.showinfo(
-                "任务执行中",
-                "请等待当前任务完成后再删除项目或 Session。",
-                parent=self.root,
-            )
-            return
         selection = self.project_tree.selection()
         if not selection:
             messagebox.showinfo("删除", "请先选择一个项目或 Session。", parent=self.root)
@@ -829,6 +986,13 @@ class HarnessGUI:
         record = next((item for item in self.sessions if item["id"] == session_id), None)
         if record is None:
             return
+        if self._runtime(session_id)["busy"]:
+            messagebox.showinfo(
+                "任务执行中",
+                "该 Session 正在运行任务，请先停止或等待其完成后再删除。",
+                parent=self.root,
+            )
+            return
         if not messagebox.askyesno(
             "删除 Session",
             f"确定删除 Session“{record['title']}”吗？\n聊天记录会从 AI Harness 中移除。",
@@ -837,8 +1001,8 @@ class HarnessGUI:
             return
         was_current = session_id == self.current_session_id
         self.sessions = [item for item in self.sessions if item["id"] != session_id]
+        self.runtimes.pop(session_id, None)
         if was_current:
-            self.session = None
             remaining = [
                 item for item in self.sessions if item["workspace"] == record["workspace"]
             ]
@@ -868,13 +1032,21 @@ class HarnessGUI:
                 parent=self.root,
             )
             return
-        session_count = sum(
-            item["workspace"] == project_path for item in self.sessions
-        )
+        project_sessions = [
+            item for item in self.sessions if item["workspace"] == project_path
+        ]
+        if any(self._runtime(item["id"])["busy"] for item in project_sessions):
+            messagebox.showinfo(
+                "任务执行中",
+                "该项目下仍有 Session 正在运行，请先停止或等待其完成后再移除项目。",
+                parent=self.root,
+            )
+            return
+        session_count = len(project_sessions)
         if not messagebox.askyesno(
             "移除项目",
             (
-                f"确定从侧边栏移除项目“{project['name']}”吗？\n"
+                f"确定从 AI Harness 中移除项目“{project['name']}”吗？\n"
                 f"同时移除其 {session_count} 个 Session，但不会删除磁盘上的项目文件。"
             ),
             parent=self.root,
@@ -886,8 +1058,9 @@ class HarnessGUI:
         self.sessions = [
             item for item in self.sessions if item["workspace"] != project_path
         ]
+        for item in project_sessions:
+            self.runtimes.pop(item["id"], None)
         if removing_current:
-            self.session = None
             target = self.projects[0]
             self.workspace = Path(target["path"]).resolve()
             matching = [
@@ -1030,13 +1203,8 @@ class HarnessGUI:
                 self._switch_project(project["path"])
 
     def _switch_project(self, path: str) -> None:
-        if self.busy:
-            messagebox.showinfo("任务执行中", "请等待当前任务完成后再切换项目。", parent=self.root)
-            self._refresh_project_list()
-            return
         self._save_state()
         self.workspace = Path(path).resolve()
-        self.session = None
         matching = [record for record in self.sessions if record["workspace"] == path]
         if matching:
             self.current_session_id = max(matching, key=lambda record: record["updated_at"])["id"]
@@ -1050,13 +1218,8 @@ class HarnessGUI:
         self._save_state()
 
     def _switch_session(self, session_id: str) -> None:
-        if self.busy:
-            messagebox.showinfo("任务执行中", "请等待当前任务完成后再切换 Session。", parent=self.root)
-            self._refresh_session_list()
-            return
         self._save_state()
         self.current_session_id = session_id
-        self.session = None
         record = self._current_record()
         self.workspace = Path(record["workspace"]).resolve()
         self._refresh_project_list()
@@ -1065,10 +1228,7 @@ class HarnessGUI:
         self._save_state()
 
     def new_conversation(self) -> None:
-        if self.busy:
-            return
         self._save_state()
-        self.session = None
         record = self._new_session_record()
         self.sessions.append(record)
         self.current_session_id = record["id"]
@@ -1081,17 +1241,40 @@ class HarnessGUI:
         record = self._current_record()
         for child in self.chat_inner.winfo_children():
             child.destroy()
+        self._body_labels.clear()
+        self._active_tool_cards.clear()
         self._rendering_history = True
-        if record["items"]:
-            for item in record["items"]:
+        items = record["items"]
+        if len(items) > MAX_RENDERED_HISTORY_ITEMS:
+            self._add_card(
+                "tool",
+                "历史记录已折叠",
+                f"当前 Session 共 {len(items)} 条记录，启动时显示最近 {MAX_RENDERED_HISTORY_ITEMS} 条。完整记录仍保存在本地会话文件中。",
+                save=False,
+            )
+            items = items[-MAX_RENDERED_HISTORY_ITEMS:]
+        if items:
+            for item in items:
                 self._add_card(item.get("role", "assistant"), item.get("title", "AI Harness"), item.get("body", ""), save=False)
         else:
             self._show_welcome()
         self._rendering_history = False
+        runtime = self._runtime(record["id"])
+        if runtime["busy"] and runtime.get("progress"):
+            card = self._add_card(
+                "tool",
+                "执行工具（运行中）",
+                runtime["progress"],
+                save=False,
+                session_id=record["id"],
+            )
+            if card is not None:
+                self._active_tool_cards[record["id"]] = card
         self.header_title.configure(text=record["title"])
         self.header_breadcrumb.configure(text=f"{self.workspace.name}   /   Session {record['id'][:6]}")
         self.composer_project.configure(text=self.workspace.name)
-        self._set_status("就绪", COLORS["success"])
+        self._refresh_composer_state()
+        self._refresh_session_status()
 
     def _show_welcome(self) -> None:
         hero = tk.Frame(self.chat_inner, bg=COLORS["app"])
@@ -1125,14 +1308,57 @@ class HarnessGUI:
         self.prompt.insert("1.0", text)
         self.prompt.focus_set()
 
-    def _add_card(self, role: str, title: str, body: str, *, save: bool = True) -> None:
+    def _initial_card_wraplength(self, role: str) -> int:
+        """Choose a safe first wrap width before Tk has laid out the card."""
+        canvas_width = self.chat_canvas.winfo_width()
+        if canvas_width <= 1:
+            return 420
+        right_margin = 160 if role == "user" else 110 if role == "tool" else 90
+        available = canvas_width - 190 - right_margin - 30
+        return max(180, min(760, available))
+
+    def _schedule_card_wrap_refresh(self) -> None:
+        if self._wrap_refresh_scheduled:
+            return
+        self._wrap_refresh_scheduled = True
+        self.root.after_idle(self._refresh_card_wraps)
+
+    def _refresh_card_wraps(self) -> None:
+        self._wrap_refresh_scheduled = False
+        try:
+            self.chat_inner.update_idletasks()
+            for label in self._body_labels:
+                if not label.winfo_exists():
+                    continue
+                bubble = label.master
+                available = bubble.winfo_width() - 30
+                if available > 0:
+                    wraplength = max(180, available)
+                    if int(label.cget("wraplength")) != wraplength:
+                        label.configure(wraplength=wraplength)
+        except tk.TclError:
+            pass
+
+    def _add_card(
+        self,
+        role: str,
+        title: str,
+        body: str,
+        *,
+        save: bool = True,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        target_id = session_id or self.current_session_id
         title = str(title)
         body = str(body)
+        record: dict[str, Any] | None = None
         if save and not self._rendering_history:
-            record = self._current_record()
+            record = self._session_record(target_id)
             record["items"].append({"role": role, "title": title, "body": body})
             record["updated_at"] = self._now()
             self._save_state()
+        if target_id != self.current_session_id:
+            return None
 
         wrapper = tk.Frame(self.chat_inner, bg=COLORS["app"])
         wrapper.pack(fill="x", padx=95, pady=(10, 5))
@@ -1155,9 +1381,51 @@ class HarnessGUI:
         header.pack(fill="x", padx=14, pady=(11, 5))
         tk.Label(header, text=avatar, width=2, bg=COLORS["accent"] if role == "assistant" else bubble["bg"], fg=COLORS["accent_text"] if role == "assistant" else title_color, font=(UI_FONT, 8, "bold")).pack(side="left", padx=(0, 7))
         tk.Label(header, text=title, bg=bubble["bg"], fg=title_color, font=(UI_FONT, 9, "bold"), anchor="w").pack(side="left")
-        tk.Label(bubble, text=body, bg=bubble["bg"], fg=COLORS["text"] if role != "tool" else COLORS["muted"], justify="left", anchor="w", wraplength=760, font=(UI_FONT, 10), padx=15, pady=0).pack(fill="x", pady=(0, 13))
+        body_label = tk.Label(
+            bubble,
+            text=body,
+            bg=bubble["bg"],
+            fg=COLORS["text"] if role != "tool" else COLORS["muted"],
+            justify="left",
+            anchor="w",
+            wraplength=self._initial_card_wraplength(role),
+            font=(UI_FONT, 10),
+            padx=15,
+            pady=0,
+        )
+        body_label.pack(fill="x", pady=(0, 13))
+        self._body_labels.append(body_label)
+        self._schedule_card_wrap_refresh()
         self.root.after_idle(self._scroll_chat_to_bottom)
         self.root.after(80, self._scroll_chat_to_bottom)
+        return {
+            "body_label": body_label,
+            "record": record,
+            "body": body,
+        }
+
+    def _update_tool_progress(self, session_id: str, message: str) -> None:
+        """Update one transient tool card instead of appending history rows."""
+        runtime = self._runtime(session_id)
+        runtime["progress"] = message
+        if session_id != self.current_session_id:
+            return
+        card = self._active_tool_cards.get(session_id)
+        if card is None:
+            card = self._add_card("tool", "执行工具（运行中）", message, session_id=session_id)
+            if card is not None:
+                self._active_tool_cards[session_id] = card
+            return
+        body_label = card.get("body_label")
+        if body_label is None:
+            return
+        try:
+            body_label.configure(text=message)
+            card["body"] = message
+            self._schedule_card_wrap_refresh()
+            self.root.after_idle(self._scroll_chat_to_bottom)
+        except tk.TclError:
+            self._active_tool_cards.pop(session_id, None)
 
     def _scroll_chat_to_bottom(self) -> None:
         """Refresh the canvas bounds before revealing the newest message."""
@@ -1170,26 +1438,43 @@ class HarnessGUI:
         except tk.TclError:
             pass
 
-    def _ensure_session(self) -> AgentSession:
-        if self.session is None:
+    def _ensure_session(self, session_id: str | None = None) -> AgentSession:
+        target_id = session_id or self.current_session_id
+        runtime = self._runtime(target_id)
+        if runtime["session"] is None:
+            record = self._session_record(target_id)
+            workspace = Path(record["workspace"]).resolve()
             model = self.model_entry.get().strip() or None
-            self.session = AgentSession(
+            session = AgentSession(
                 max_turns=self.max_turns,
-                workspace=self.workspace,
+                workspace=workspace,
                 approval_mode=self.permission_var.get(),
                 full_access=self.permission_var.get() == "full-access",
                 model_name=model,
-                event_callback=lambda kind, message: self.event_queue.put((kind, message)),
-                approver=self._gui_approver,
+                event_callback=lambda kind, message: self.event_queue.put(
+                    (kind, {"session_id": target_id, "message": message})
+                ),
+                approver=lambda command, cwd: self._gui_approver(target_id, command, cwd),
             )
-            saved_messages = self._current_record().get("messages", [])
+            saved_messages = record.get("messages", [])
             if saved_messages:
-                self.session.messages.extend(saved_messages)
-            self.model_name = model or self.session.model_name
-        return self.session
+                session.messages.extend(saved_messages)
+            repaired = session.repair_tool_call_history()
+            self.model_name = model or session.model_name
+            runtime["session"] = session
+            if repaired:
+                runtime["history_repaired"] = repaired
+                self._add_card(
+                    "tool",
+                    "会话恢复",
+                    f"检测到 {repaired} 个未完成的工具调用，已补齐中断结果，可以继续运行。",
+                    session_id=target_id,
+                )
+                self._save_state()
+        return runtime["session"]
 
     def send_message(self) -> None:
-        if self.busy:
+        if self._active_runtime()["busy"]:
             return
         task = self.prompt.get("1.0", "end").strip()
         attachments = list(self.pending_attachments)
@@ -1217,34 +1502,36 @@ class HarnessGUI:
             return
 
         self.prompt.delete("1.0", "end")
-        record = self._current_record()
+        session_id = self.current_session_id
+        runtime = self._runtime(session_id)
+        record = self._session_record(session_id)
         first_exchange = not record["items"]
         display_text = task
         if attachments:
             display_text += "\n\n附件：" + "、".join(path.name for path in attachments)
-        self._add_card("user", "你", display_text)
+        self._add_card("user", "你", display_text, session_id=session_id)
         self._refresh_session_list()
-        self.busy = True
-        self.paused = False
-        self.stop_pending = False
-        self._set_busy(True)
-        self._set_status("工作中", COLORS["warning"])
+        runtime["busy"] = True
+        runtime["paused"] = False
+        runtime["stop_pending"] = False
+        self._refresh_composer_state()
+        self._refresh_session_status()
         try:
-            session = self._ensure_session()
+            session = self._ensure_session(session_id)
         except Exception as exc:
-            self.busy = False
-            self._set_busy(False)
-            self._set_status("配置需要检查", COLORS["danger"])
-            self._add_card("assistant", "无法连接模型", str(exc))
+            runtime["busy"] = False
+            self._refresh_composer_state()
+            self._refresh_session_status()
+            self._add_card("assistant", "无法连接模型", str(exc), session_id=session_id)
             return
         self.pending_attachments = []
         self._refresh_attachment_bar()
-        self.worker_thread = threading.Thread(
+        runtime["worker"] = threading.Thread(
             target=self._run_task,
-            args=(session, task, attachments, record["id"], first_exchange),
+            args=(session, task, attachments, session_id, first_exchange),
             daemon=True,
         )
-        self.worker_thread.start()
+        runtime["worker"].start()
 
     def _run_task(
         self,
@@ -1274,60 +1561,156 @@ class HarnessGUI:
                 )
             )
         except AgentPaused:
-            self.event_queue.put(("paused", "运行已停止"))
+            self.event_queue.put(
+                ("paused", {"session_id": session_id, "message": "运行已停止"})
+            )
         except Exception as exc:
-            self.event_queue.put(("error", str(exc)))
+            self.event_queue.put(
+                ("error", {"session_id": session_id, "message": str(exc)})
+            )
 
-    def _run_resume(self, session: AgentSession) -> None:
+    def _run_resume(self, session: AgentSession, session_id: str) -> None:
         try:
             answer = session.resume()
-            self.event_queue.put(("answer", answer or "Agent 没有返回文字结果。"))
+            self.event_queue.put(
+                (
+                    "answer",
+                    {
+                        "answer": answer or "Agent 没有返回文字结果。",
+                        "session_id": session_id,
+                        "title": "",
+                    },
+                )
+            )
         except AgentPaused:
-            self.event_queue.put(("paused", "运行已停止"))
+            self.event_queue.put(
+                ("paused", {"session_id": session_id, "message": "运行已停止"})
+            )
         except Exception as exc:
-            self.event_queue.put(("error", str(exc)))
+            self.event_queue.put(
+                ("error", {"session_id": session_id, "message": str(exc)})
+            )
 
     def _drain_events(self) -> None:
         try:
             while True:
                 kind, message = self.event_queue.get_nowait()
                 if kind == "approval_request":
-                    self._show_approval_dialog(message)
+                    if self.active_approval is None:
+                        self._show_approval_dialog(message)
+                    else:
+                        self.approval_queue.append(message)
                 elif kind == "approval_review":
-                    self.pending_review_message = (
-                        str(message) if str(message).startswith("需要确认") else ""
+                    session_id = (
+                        str(message.get("session_id", ""))
+                        if isinstance(message, dict)
+                        else ""
                     )
-                    self._add_card("tool", "审批审查", str(message))
+                    review_text = (
+                        str(message.get("message", ""))
+                        if isinstance(message, dict)
+                        else str(message)
+                    )
+                    runtime = self._runtime(session_id)
+                    runtime["pending_review_message"] = (
+                        review_text if review_text.startswith("需要确认") else ""
+                    )
+                    self._add_card("tool", "审批审查", review_text, session_id=session_id)
                 elif kind == "tool_start":
-                    self._add_card("tool", "执行工具", message)
+                    session_id = (
+                        str(message.get("session_id", ""))
+                        if isinstance(message, dict)
+                        else ""
+                    )
+                    text = (
+                        str(message.get("message", ""))
+                        if isinstance(message, dict)
+                        else str(message)
+                    )
+                    self._active_tool_cards.pop(session_id, None)
+                    card = self._add_card("tool", "执行工具", text, session_id=session_id)
+                    if card is not None:
+                        self._active_tool_cards[session_id] = card
+                elif kind == "tool_progress":
+                    session_id = (
+                        str(message.get("session_id", ""))
+                        if isinstance(message, dict)
+                        else ""
+                    )
+                    text = (
+                        str(message.get("message", ""))
+                        if isinstance(message, dict)
+                        else str(message)
+                    )
+                    self._update_tool_progress(session_id, text)
+                elif kind == "model_retry":
+                    session_id = (
+                        str(message.get("session_id", ""))
+                        if isinstance(message, dict)
+                        else ""
+                    )
+                    text = (
+                        str(message.get("message", ""))
+                        if isinstance(message, dict)
+                        else str(message)
+                    )
+                    self._add_card("tool", "连接重试", text, save=False, session_id=session_id)
                 elif kind == "tool_result":
-                    self._add_card("tool", "工具结果", message)
+                    session_id = (
+                        str(message.get("session_id", ""))
+                        if isinstance(message, dict)
+                        else ""
+                    )
+                    text = (
+                        str(message.get("message", ""))
+                        if isinstance(message, dict)
+                        else str(message)
+                    )
+                    self._active_tool_cards.pop(session_id, None)
+                    self._runtime(session_id)["progress"] = ""
+                    self._add_card("tool", "工具结果", text, session_id=session_id)
                 elif kind == "answer":
                     answer_text = message
+                    session_id = ""
+                    title = ""
                     if isinstance(message, dict):
                         answer_text = str(message.get("answer", ""))
                         session_id = str(message.get("session_id", ""))
                         title = str(message.get("title", ""))[:11]
-                        if title:
-                            record = next(
-                                (
-                                    item for item in self.sessions
-                                    if item["id"] == session_id
-                                ),
-                                None,
-                            )
-                            if record is not None:
-                                record["title"] = title
-                                if session_id == self.current_session_id:
-                                    self.header_title.configure(text=title)
-                                self._refresh_session_list()
-                    self._add_card("assistant", "AI Harness", str(answer_text))
-                    self._finish_task("就绪", COLORS["success"])
+                    if title:
+                        record = self._session_record(session_id)
+                        record["title"] = title
+                        if session_id == self.current_session_id:
+                            self.header_title.configure(text=title)
+                        self._refresh_session_list()
+                    self._active_tool_cards.pop(session_id, None)
+                    self._runtime(session_id)["progress"] = ""
+                    self._add_card("assistant", "AI Harness", str(answer_text), session_id=session_id)
+                    self._finish_task(session_id, "就绪", COLORS["success"])
                 elif kind == "error":
-                    self._add_card("assistant", "执行失败", message)
-                    self._finish_task("发生错误", COLORS["danger"])
+                    session_id = (
+                        str(message.get("session_id", ""))
+                        if isinstance(message, dict)
+                        else ""
+                    )
+                    error_text = (
+                        str(message.get("message", message))
+                        if isinstance(message, dict)
+                        else str(message)
+                    )
+                    self._active_tool_cards.pop(session_id, None)
+                    self._runtime(session_id)["progress"] = ""
+                    self._add_card("assistant", "执行失败", error_text, session_id=session_id)
+                    self._finish_task(session_id, "发生错误", COLORS["danger"])
                 elif kind == "paused":
-                    self._mark_paused()
+                    session_id = (
+                        str(message.get("session_id", ""))
+                        if isinstance(message, dict)
+                        else ""
+                    )
+                    self._active_tool_cards.pop(session_id, None)
+                    self._runtime(session_id)["progress"] = ""
+                    self._mark_paused(session_id)
         except queue.Empty:
             pass
         except Exception:
@@ -1340,82 +1723,96 @@ class HarnessGUI:
             if not self.closing:
                 self.root.after(100, self._drain_events)
 
-    def _finish_task(self, status: str, color: str) -> None:
-        self.busy = False
-        self.paused = False
-        self.stop_pending = False
-        self._set_busy(False)
-        self._set_status(status, color)
-        self._current_record()["updated_at"] = self._now()
+    def _finish_task(self, session_id: str, status: str, color: str) -> None:
+        runtime = self._runtime(session_id)
+        runtime["busy"] = False
+        runtime["paused"] = False
+        runtime["stop_pending"] = False
+        runtime["worker"] = None
+        self._session_record(session_id)["updated_at"] = self._now()
+        if session_id == self.current_session_id:
+            self._refresh_composer_state()
+            self.prompt.focus_set()
+        self._refresh_session_status()
         self._save_state()
         self._refresh_session_list()
 
-    def _set_busy(self, busy: bool) -> None:
-        self.prompt.configure(state="disabled" if busy else "normal")
-        if busy:
+    def _refresh_composer_state(self) -> None:
+        runtime = self._active_runtime()
+        if runtime["busy"]:
+            self.prompt.configure(state="disabled")
             self.send_button.configure(
                 state="normal",
-                text="■",
-                command=self.stop_running,
+                text="▶" if runtime["paused"] else "■",
+                command=self.resume_running if runtime["paused"] else self.stop_running,
                 style="Run.TButton",
             )
         else:
+            self.prompt.configure(state="normal")
             self.send_button.configure(
                 state="normal",
                 text="发送  ↑",
                 command=self.send_message,
                 style="Primary.TButton",
             )
-            self.prompt.focus_set()
+
+    def _refresh_session_status(self) -> None:
+        runtime = self._active_runtime()
+        if runtime["busy"] and runtime["paused"]:
+            self._set_status("已停止", COLORS["warning"])
+        elif runtime["busy"]:
+            self._set_status("工作中", COLORS["warning"])
+        else:
+            self._set_status("就绪", COLORS["success"])
+        running = sum(1 for item in self.runtimes.values() if item["busy"])
+        if running:
+            self.sidebar_status.configure(text=f"{running} 个任务运行中")
+            self.status_dot.configure(fg=COLORS["warning"])
 
     def stop_running(self) -> None:
-        if not self.busy or self.paused:
+        runtime = self._active_runtime()
+        if not runtime["busy"] or runtime["paused"]:
             return
-        self.paused = True
-        self.stop_pending = True
-        if self.session is not None:
-            self.session.request_stop()
-        self._resolve_active_approval(False)
-        self.send_button.configure(
-            text="▶",
-            command=self.resume_running,
-            style="Run.TButton",
-        )
+        runtime["paused"] = True
+        runtime["stop_pending"] = True
+        session = runtime["session"]
+        if session is not None:
+            session.request_stop()
+        self._resolve_active_approval(False, self.current_session_id)
+        self._refresh_composer_state()
         self._set_status("正在停止", COLORS["warning"])
 
-    def _mark_paused(self) -> None:
-        self.busy = True
-        self.paused = True
-        self.stop_pending = False
-        self.prompt.configure(state="disabled")
-        self.send_button.configure(
-            state="normal",
-            text="▶",
-            command=self.resume_running,
-            style="Run.TButton",
-        )
-        self._set_status("已停止", COLORS["warning"])
+    def _mark_paused(self, session_id: str) -> None:
+        runtime = self._runtime(session_id)
+        runtime["busy"] = True
+        runtime["paused"] = True
+        runtime["stop_pending"] = False
+        if session_id == self.current_session_id:
+            self._refresh_composer_state()
+        self._refresh_session_status()
         self._snapshot_agent_messages()
         self._save_state()
 
     def resume_running(self) -> None:
-        if not self.paused or self.session is None:
+        runtime = self._active_runtime()
+        session = runtime["session"]
+        if not runtime["paused"] or session is None:
             return
-        if self.stop_pending or (
-            self.worker_thread is not None and self.worker_thread.is_alive()
+        if runtime["stop_pending"] or (
+            runtime["worker"] is not None and runtime["worker"].is_alive()
         ):
             self._set_status("正在停止，请稍候", COLORS["warning"])
             return
-        self.paused = False
-        self.busy = True
-        self._set_busy(True)
+        runtime["paused"] = False
+        runtime["busy"] = True
+        self._refresh_composer_state()
         self._set_status("继续运行", COLORS["warning"])
-        self.worker_thread = threading.Thread(
+        runtime["worker"] = threading.Thread(
             target=self._run_resume,
-            args=(self.session,),
+            args=(session, self.current_session_id),
             daemon=True,
         )
-        self.worker_thread.start()
+        runtime["worker"].start()
 
     def _set_status(self, text: str, color: str) -> None:
         self.sidebar_status.configure(text=text)
@@ -1423,9 +1820,10 @@ class HarnessGUI:
         self.header_status.configure(text=text)
         self.header_status_dot.configure(fg=color)
 
-    def _gui_approver(self, command: str, cwd: Path) -> bool:
+    def _gui_approver(self, session_id: str, command: str, cwd: Path) -> bool:
         """Ask for approval on the Tk thread and wait from the worker thread."""
         request: dict[str, Any] = {
+            "session_id": session_id,
             "command": command,
             "cwd": str(cwd),
             "decision": False,
@@ -1433,10 +1831,9 @@ class HarnessGUI:
             "cancelled": False,
         }
         self.event_queue.put(("approval_request", request))
+        session = self._runtime(session_id)["session"]
         while not request["event"].wait(0.1):
-            if self.closing or (
-                self.session is not None and self.session.stop_event.is_set()
-            ):
+            if self.closing or (session is not None and session.stop_event.is_set()):
                 request["cancelled"] = True
                 request["event"].set()
                 return False
@@ -1445,9 +1842,10 @@ class HarnessGUI:
     def _show_approval_dialog(self, request: dict[str, Any]) -> None:
         if request["cancelled"] or request["event"].is_set():
             return
-        self._resolve_active_approval(False)
-        review_message = self.pending_review_message
-        self.pending_review_message = ""
+        session_id = str(request.get("session_id", ""))
+        runtime = self._runtime(session_id)
+        review_message = runtime["pending_review_message"]
+        runtime["pending_review_message"] = ""
         dialog = tk.Toplevel(self.root)
         dialog.title("请求批准")
         dialog.geometry("720x540")
@@ -1536,9 +1934,11 @@ class HarnessGUI:
         dialog.protocol("WM_DELETE_WINDOW", lambda: self._resolve_active_approval(False))
         dialog.bind("<Escape>", lambda _event: self._resolve_active_approval(False))
 
-    def _resolve_active_approval(self, approved: bool) -> None:
+    def _resolve_active_approval(self, approved: bool, session_id: str | None = None) -> None:
         request = self.active_approval
         if request is None:
+            return
+        if session_id is not None and request.get("session_id") != session_id:
             return
         self.active_approval = None
         request["decision"] = approved
@@ -1550,6 +1950,10 @@ class HarnessGUI:
             except tk.TclError:
                 pass
             dialog.destroy()
+        if self.approval_queue:
+            next_request = self.approval_queue.pop(0)
+            if not next_request["cancelled"] and not next_request["event"].is_set():
+                self._show_approval_dialog(next_request)
 
     def change_permission(self, _event: tk.Event[Any] | None = None) -> None:
         if _event is not None:
@@ -1562,9 +1966,10 @@ class HarnessGUI:
             mode = self.permission_var.get()
             self.permission_display_var.set(PERMISSION_LABELS[mode])
         self.permission_mode = mode
-        if self.session is not None:
+        session = self._active_runtime()["session"]
+        if session is not None:
             try:
-                self.session.set_permission_mode(mode)
+                session.set_permission_mode(mode)
             except ValueError as exc:
                 messagebox.showerror("权限模式", str(exc), parent=self.root)
                 return
@@ -1674,12 +2079,15 @@ class HarnessGUI:
         os.environ["AI_HARNESS_BASE_URL"] = api_url
         os.environ["AI_HARNESS_MODEL"] = model
         os.environ["AI_HARNESS_ENV_FILE"] = str(self.config_path)
-        self.session = None
+        for runtime in self.runtimes.values():
+            runtime["session"] = None
 
     def _on_close(self) -> None:
         self.closing = True
-        if self.session is not None:
-            self.session.request_stop()
+        for runtime in self.runtimes.values():
+            session = runtime["session"]
+            if session is not None:
+                session.request_stop()
         self._resolve_active_approval(False)
         self._save_state()
         self.root.destroy()
@@ -1696,7 +2104,15 @@ def launch_gui(
     """Start the desktop UI."""
     _enable_windows_dpi_awareness()
     _set_windows_app_user_model_id()
-    root = tk.Tk()
+    _configure_tk_runtime()
+    try:
+        root = tk.Tk()
+    except Exception as exc:
+        _write_startup_error(f"Tk GUI 初始化失败：{exc}")
+        raise RuntimeError(
+            "GUI 启动失败：找不到可用的 Tcl/Tk 运行时或图形会话。"
+            "详见 ~/.ai-harness/gui-startup-error.log"
+        ) from exc
     HarnessGUI(
         root,
         workspace=workspace,

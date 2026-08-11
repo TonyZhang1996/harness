@@ -1,4 +1,5 @@
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -199,6 +200,224 @@ def test_agent_executes_tool_and_reports_events(tmp_path):
     assert session.ask("创建文件") == "完成"
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "hello"
     assert [kind for kind, _message in events] == ["tool_start", "tool_result"]
+
+
+def test_agent_repairs_interrupted_tool_call_before_resume():
+    tool_call = SimpleNamespace(
+        id="call-interrupted",
+        function=SimpleNamespace(name="run_command", arguments='{"command":"echo ok"}'),
+    )
+    captured = []
+
+    class ResumeCompletions:
+        def create(self, **kwargs):
+            captured.append(kwargs["messages"])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="已恢复", tool_calls=None))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=ResumeCompletions()))
+    session = AgentSession(client=client, model_name="test-model")
+    session.messages.extend(
+        [
+            {"role": "user", "content": "执行任务"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {"name": "run_command", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+    )
+
+    assert session.resume() == "已恢复"
+    messages = captured[0]
+    assert messages[-1]["role"] == "assistant"
+    tool_index = next(i for i, item in enumerate(messages) if item.get("role") == "tool")
+    assert messages[tool_index]["tool_call_id"] == tool_call.id
+    assert "中断" in messages[tool_index]["content"]
+
+
+def test_agent_retries_transient_model_transport_error(monkeypatch):
+    calls = 0
+
+    class FlakyCompletions:
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("Error -3 while decompressing data: incorrect header check")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="重试成功", tool_calls=None))]
+            )
+
+    monkeypatch.setattr(agent_module.time, "sleep", lambda _seconds: None)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FlakyCompletions()))
+    session = AgentSession(client=client, model_name="test-model")
+
+    assert session.ask("测试网络重试") == "重试成功"
+    assert calls == 2
+
+
+def test_agent_sessions_run_concurrently_with_independent_history():
+    import time
+
+    class SlowCompletions:
+        def __init__(self, content):
+            self.content = content
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append({**kwargs, "messages": list(kwargs["messages"])})
+            time.sleep(0.05)
+            message = SimpleNamespace(content=self.content, tool_calls=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    class SlowClient:
+        def __init__(self, content):
+            self.chat = SimpleNamespace(completions=SlowCompletions(content))
+
+    first_client = SlowClient("第一个会话完成")
+    second_client = SlowClient("第二个会话完成")
+    session_a = AgentSession(client=first_client, model_name="test-model")
+    session_b = AgentSession(client=second_client, model_name="test-model")
+
+    results = {}
+
+    def run_a():
+        results["a"] = session_a.ask("任务A")
+
+    def run_b():
+        results["b"] = session_b.ask("任务B")
+
+    threads = [threading.Thread(target=run_a), threading.Thread(target=run_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert results == {"a": "第一个会话完成", "b": "第二个会话完成"}
+    assert "任务A" in first_client.chat.completions.calls[0]["messages"][1]["content"]
+    assert "任务B" in second_client.chat.completions.calls[0]["messages"][1]["content"]
+    assert session_a.messages[1]["content"] == "任务A"
+    assert session_b.messages[1]["content"] == "任务B"
+    assert len(session_a.messages) == 3
+    assert len(session_b.messages) == 3
+
+
+def test_gui_mousewheel_units_support_mac_and_x11(monkeypatch):
+    import ai_harness.gui as gui_module
+
+    monkeypatch.setattr(gui_module.platform, "system", lambda: "Darwin")
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=1, num=None)) == -1
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=-1, num=None)) == 1
+
+    monkeypatch.setattr(gui_module.platform, "system", lambda: "Linux")
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=120, num=None)) == -1
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=-240, num=None)) == 2
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=0, num=4)) == -1
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=0, num=5)) == 1
+
+
+def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
+    """Two Sessions can run agent turns in parallel with independent history."""
+    tkinter = pytest.importorskip("tkinter")
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+    except Exception as exc:  # headless CI without an X server
+        pytest.skip(f"无法初始化 Tk 界面：{exc}")
+
+    import ai_harness.gui as gui_module
+    from ai_harness.gui import HarnessGUI
+
+    barrier = threading.Barrier(2)
+    started_tasks: list[str] = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.messages = [{"role": "system", "content": "sys"}]
+            self.stop_event = threading.Event()
+            self.model_name = kwargs.get("model_name") or "test-model"
+            self.event_callback = kwargs.get("event_callback")
+
+        def ask(self, task, attachments=None):
+            started_tasks.append(task)
+            barrier.wait(timeout=5)
+            if self.event_callback is not None:
+                self.event_callback("tool_start", "执行工具")
+                self.event_callback("tool_result", "工具结果")
+            return f"回答:{task}"
+
+        def resume(self):
+            return "继续回答"
+
+        def request_stop(self):
+            self.stop_event.set()
+
+        def set_permission_mode(self, mode):
+            return mode
+
+        def generate_session_title(self, question, answer, max_chars=11):
+            return "并发标题"
+
+    monkeypatch.setattr(gui_module, "AgentSession", FakeSession)
+
+    try:
+        gui = HarnessGUI(
+            root,
+            workspace=str(tmp_path),
+            state_path=str(tmp_path / "gui-state.json"),
+            config_path=str(tmp_path / "conn.env"),
+        )
+        gui.prompt.insert("1.0", "任务A")
+        gui.send_message()
+        session_a_id = gui.current_session_id
+
+        gui.new_conversation()
+        session_b_id = gui.current_session_id
+        gui.prompt.insert("1.0", "任务B")
+        gui.send_message()
+
+        # Both Sessions must be busy at the same time (true parallelism).
+        assert gui._runtime(session_a_id)["busy"] is True
+        assert gui._runtime(session_b_id)["busy"] is True
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            gui._drain_events()
+            if (
+                not gui._runtime(session_a_id)["busy"]
+                and not gui._runtime(session_b_id)["busy"]
+            ):
+                break
+            time.sleep(0.02)
+        gui._drain_events()
+
+        assert not gui._runtime(session_a_id)["busy"]
+        assert not gui._runtime(session_b_id)["busy"]
+
+        record_a = gui._session_record(session_a_id)
+        record_b = gui._session_record(session_b_id)
+        assert record_a["title"] == "并发标题"
+        assert record_a["items"][-1]["body"] == "回答:任务A"
+        assert record_b["items"][-1]["body"] == "回答:任务B"
+        tool_bodies = [
+            item["body"] for item in record_a["items"] if item["role"] == "tool"
+        ]
+        assert "执行工具" in tool_bodies
+
+        # Switching back to Session A renders only its own cards.
+        gui._switch_session(session_a_id)
+        bodies = [item["body"] for item in gui._current_record()["items"]]
+        assert "回答:任务A" in bodies
+    finally:
+        root.destroy()
 
 
 def test_full_access_forces_automatic_command_approval(tmp_path):

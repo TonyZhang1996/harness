@@ -5,7 +5,7 @@ import inspect
 
 
 def test_package_has_version():
-    assert __version__ == "0.4.1"
+    assert __version__ == "0.4.2"
 
 
 def test_parser_accepts_task():

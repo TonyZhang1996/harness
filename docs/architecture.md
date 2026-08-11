@@ -30,6 +30,7 @@ AgentSession --- conversation history
 - 摄像头工具通过 FFmpeg 的 Windows DirectShow、macOS AVFoundation 或 Linux V4L2 后端采集单帧，并校验输出文件。
 - `approval.py`：处理 Shell 命令审批策略。
 - `cli.py`：提供单次任务和连续交互界面。
+- `gui.py`：Tkinter 桌面工作台。每个 Session 拥有独立的 `AgentSession` 与工作线程，多个 Session 可同时运行；工具事件按 `session_id` 路由到对应 Session 的记录，审批请求按 FIFO 依次弹出确认窗口。项目树与对话画布统一处理跨平台鼠标滚轮事件；删除 Session 或移除项目前会检查运行状态并要求确认，移除项目不会删除磁盘文件。
 - Python console script 提供跨平台 `harness` 命令，`python -m ai_harness` 提供通用备用入口。
 - `bin/harness`：保留给已有 macOS 本地开发安装的兼容启动器。
 

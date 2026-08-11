@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
@@ -41,6 +42,7 @@ SENSITIVE_ENV_KEYS = {
     "OPENAI_API_KEY",
 }
 ApprovalCallback = Callable[[str, Path], bool]
+CommandProgressCallback = Callable[[str], None]
 
 
 def _get_filesystem_roots() -> tuple[Path, ...]:
@@ -462,6 +464,7 @@ def run_command(
     allowed_roots: Iterable[str | Path] | None = None,
     approval_callback: ApprovalCallback | None = None,
     cancel_event: threading.Event | None = None,
+    progress_callback: CommandProgressCallback | None = None,
 ) -> str:
     """Run a shell command after approval, without forwarding model API keys."""
     if not command.strip():
@@ -489,33 +492,120 @@ def run_command(
         cwd=command_cwd,
         env=_clean_subprocess_env(),
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
         **_hidden_subprocess_kwargs(),
     )
     deadline = time.monotonic() + timeout
     stopped = False
     timed_out = False
-    while True:
-        try:
-            stdout, stderr = process.communicate(timeout=0.15)
-            break
-        except subprocess.TimeoutExpired:
+    output_parts: list[str] = []
+
+    # Keep compatibility with lightweight Popen fakes used by callers/tests that
+    # do not expose a stdout pipe. Real processes use the streaming path below.
+    if getattr(process, "stdout", None) is None:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.15)
+                output_parts.append(stdout + stderr)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_event is not None and cancel_event.is_set():
+                    stopped = True
+                elif time.monotonic() >= deadline:
+                    timed_out = True
+                else:
+                    continue
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                output_parts.append(stdout + stderr)
+                break
+    else:
+        output_queue: queue.Queue[str | None] = queue.Queue()
+
+        def read_output() -> None:
+            try:
+                for chunk in iter(process.stdout.readline, ""):
+                    output_queue.put(chunk)
+            finally:
+                output_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        stream_closed = False
+        started_at = time.monotonic()
+        next_progress_at = started_at + 1.0
+
+        def emit_progress(now: float) -> None:
+            if progress_callback is None:
+                return
+            elapsed = max(1, int(now - started_at))
+            output = "".join(output_parts).strip()
+            if output:
+                recent = output[-1200:]
+                message = f"运行中 · 已用时 {elapsed}s\n{recent}"
+            else:
+                message = f"运行中 · 已用时 {elapsed}s · 命令暂时没有输出"
+            try:
+                progress_callback(message)
+            except Exception:
+                # A UI/event listener must never interrupt the command itself.
+                pass
+
+        while True:
+            try:
+                chunk = output_queue.get(timeout=0.15)
+                if chunk is None:
+                    stream_closed = True
+                else:
+                    output_parts.append(chunk)
+            except queue.Empty:
+                pass
+
+            now = time.monotonic()
+            if progress_callback is not None and now >= next_progress_at:
+                emit_progress(now)
+                next_progress_at = now + 1.5
+
+            if process.poll() is not None and stream_closed:
+                break
             if cancel_event is not None and cancel_event.is_set():
                 stopped = True
-            elif time.monotonic() >= deadline:
+            elif now >= deadline:
                 timed_out = True
-            else:
-                continue
-            process.terminate()
-            try:
-                stdout, stderr = process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-            break
+            if stopped or timed_out:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                # Closing the parent's read end also unblocks a shell whose
+                # child inherited stdout while the command is being stopped.
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+                break
 
-    output = stdout + stderr
+        # Drain data already delivered by the reader before rendering the final
+        # result. Do not wait indefinitely for descendants that kept a pipe open.
+        drain_deadline = time.monotonic() + 0.5
+        while time.monotonic() < drain_deadline:
+            try:
+                chunk = output_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+            output_parts.append(chunk)
+
+    output = "".join(output_parts)
     if stopped:
         return f"命令执行已由用户停止\n{output[:max_chars]}".rstrip()
     if timed_out:

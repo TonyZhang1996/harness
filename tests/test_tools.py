@@ -158,6 +158,22 @@ def test_run_command_does_not_forward_api_keys(tmp_path: Path, monkeypatch):
     assert "退出码: 1" in result
 
 
+def test_run_command_reports_progress_while_silent(tmp_path: Path):
+    progress: list[str] = []
+    command = _python_command("import time; time.sleep(1.3)")
+
+    result = run_command(
+        command,
+        workspace_root=tmp_path,
+        timeout=5,
+        approval_callback=lambda _command, _cwd: True,
+        progress_callback=progress.append,
+    )
+
+    assert "退出码: 0" in result
+    assert any("运行中" in message and "没有输出" in message for message in progress)
+
+
 def test_mutation_through_symlink_is_rejected(tmp_path: Path):
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"

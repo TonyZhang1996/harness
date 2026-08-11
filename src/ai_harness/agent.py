@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import threading
+import time
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
@@ -22,6 +23,7 @@ from .approval import AutoReviewApprover, CommandApprover
 from .config import ModelConfig
 from .model import create_client
 from .tools import (
+    CommandProgressCallback,
     _get_allowed_roots,
     _get_filesystem_roots,
     capture_photo,
@@ -282,6 +284,11 @@ Do not expose API keys or secrets. Respond in the user's language and summarize 
 
 EventCallback = Callable[[str, str], None]
 
+_INTERRUPTED_TOOL_RESULT = (
+    "工具调用在应用中断或模型连接失败前没有返回结果。"
+    "请根据当前上下文重新执行该工具，或向用户说明该步骤尚未完成。"
+)
+
 
 class AgentPaused(RuntimeError):
     """Raised when the user stops a running agent turn."""
@@ -292,6 +299,7 @@ def _handlers_for_workspace(
     allowed_paths: Sequence[str | Path] | None = None,
     approval_callback: Callable[[str, Path], bool] | None = None,
     cancel_event: threading.Event | None = None,
+    progress_callback: CommandProgressCallback | None = None,
     full_access: bool = False,
 ) -> dict[str, Callable[..., str]]:
     """Bind every tool to one workspace, extra roots, and approval policy."""
@@ -312,6 +320,7 @@ def _handlers_for_workspace(
             kwargs["approval_callback"] = approval_callback
         if name == "run_command":
             kwargs["cancel_event"] = cancel_event
+            kwargs["progress_callback"] = progress_callback
         if name in {
             "read_file",
             "search_text",
@@ -377,6 +386,80 @@ def _safe_tool_summary(name: str, arguments_json: str) -> str:
     return f"{name} {json.dumps(safe, ensure_ascii=False)}"
 
 
+def _repair_tool_call_history(messages: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Make interrupted tool-call transcripts valid for the chat-completions API."""
+    repaired: list[dict[str, Any]] = []
+    repairs = 0
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict):
+            repaired.append(message)
+            index += 1
+            continue
+        repaired.append(message)
+        index += 1
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        expected_ids = [
+            str(call.get("id"))
+            for call in tool_calls
+            if isinstance(call, dict) and call.get("id")
+        ]
+        if not expected_ids:
+            continue
+
+        seen_ids: set[str] = set()
+        while index < len(messages):
+            candidate = messages[index]
+            if candidate.get("role") != "tool":
+                break
+            tool_call_id = str(candidate.get("tool_call_id", ""))
+            if tool_call_id in expected_ids and tool_call_id not in seen_ids:
+                repaired.append(candidate)
+                seen_ids.add(tool_call_id)
+            else:
+                # A duplicate/orphan tool message would also make the API reject
+                # the whole transcript, so discard only that malformed entry.
+                repairs += 1
+            index += 1
+
+        for tool_call_id in expected_ids:
+            if tool_call_id in seen_ids:
+                continue
+            repaired.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": _INTERRUPTED_TOOL_RESULT,
+                }
+            )
+            repairs += 1
+    return repaired, repairs
+
+
+def _is_transient_model_error(exc: Exception) -> bool:
+    """Recognize transport failures worth retrying once."""
+    text = str(exc).lower()
+    markers = (
+        "decompress",
+        "incorrect header",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "read timeout",
+        "timed out",
+        "temporarily unavailable",
+        "502",
+        "503",
+        "504",
+    )
+    return any(marker in text for marker in markers)
+
+
 class AgentSession:
     """A stateful model/tool session for interactive conversations."""
 
@@ -439,6 +522,7 @@ class AgentSession:
             self.allowed_paths,
             self.approver,
             self.stop_event,
+            lambda message: self._emit("tool_progress", message),
             full_access=self.full_access,
         )
 
@@ -546,6 +630,24 @@ class AgentSession:
         if self.stop_event.is_set():
             raise AgentPaused("运行已由用户停止")
 
+    def repair_tool_call_history(self) -> int:
+        """Repair a transcript left incomplete by an app exit or network failure."""
+        self.messages, repairs = _repair_tool_call_history(self.messages)
+        return repairs
+
+    def _create_completion(self, **kwargs: Any) -> Any:
+        """Retry one transient transport/decompression failure."""
+        for attempt in range(2):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                if attempt == 0 and _is_transient_model_error(exc):
+                    self._emit("model_retry", "模型连接出现临时网络异常，正在重试（1/1）")
+                    time.sleep(0.8)
+                    continue
+                raise
+        raise RuntimeError("模型请求失败")
+
     def _append_cancelled_tool_results(self, tool_calls: Sequence[Any]) -> None:
         for tool_call in tool_calls:
             self.messages.append(
@@ -618,6 +720,7 @@ class AgentSession:
         if not resume and not task.strip():
             return ""
         self.stop_event.clear()
+        self.repair_tool_call_history()
         if not resume:
             self.messages.append(
                 {"role": "user", "content": self._user_content(task, attachments)}
@@ -625,7 +728,7 @@ class AgentSession:
 
         for _ in range(self.max_turns):
             self._raise_if_stopped()
-            response = self.client.chat.completions.create(
+            response = self._create_completion(
                 model=self.model_name,
                 messages=self.messages,
                 tools=TOOL_DEFINITIONS,
@@ -686,7 +789,7 @@ class AgentSession:
         max_chars: int = 11,
     ) -> str:
         """Generate a short title from the completed first question and answer."""
-        response = self.client.chat.completions.create(
+        response = self._create_completion(
             model=self.model_name,
             messages=[
                 {
