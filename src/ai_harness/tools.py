@@ -13,6 +13,12 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from urllib.parse import urlencode
+
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+except ImportError:  # pragma: no cover - actionable runtime error below
+    _sync_playwright = None  # type: ignore[assignment]
 
 
 WORKSPACE_ROOT = Path.cwd().resolve()
@@ -259,6 +265,92 @@ def search_text(
                     matches.append("[结果已截断]")
                     return "\n".join(matches)
     return "\n".join(matches) or "[未找到匹配内容]"
+
+
+def browser_search(
+    query: str,
+    engine: str = "baidu",
+    max_chars: int = 12_000,
+    timeout: int = 45,
+    workspace_root: str | Path | None = None,
+    allowed_roots: Iterable[str | Path] | None = None,
+    approval_callback: ApprovalCallback | None = None,
+) -> str:
+    """Search public web results through a fresh headless Chromium context.
+
+    The tool intentionally accepts a query rather than an arbitrary URL. This
+    keeps browser access useful for current-information questions without
+    allowing the model to navigate to local files, private pages, or arbitrary
+    endpoints.
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("搜索关键词不能为空")
+    if engine not in {"baidu", "bing"}:
+        raise ValueError("engine 只能是 baidu 或 bing")
+    if max_chars < 1:
+        raise ValueError("max_chars 必须大于 0")
+    if timeout < 5 or timeout > 120:
+        raise ValueError("timeout 必须在 5 到 120 秒之间")
+
+    root = _get_workspace_root(workspace_root)
+    if engine == "baidu":
+        search_url = "https://www.baidu.com/s?" + urlencode({"wd": query})
+    else:
+        search_url = "https://www.bing.com/search?" + urlencode({"q": query})
+    approval_text = f"使用无头浏览器访问公开搜索引擎 {engine}，搜索：{query.strip()[:500]}"
+    if approval_callback is None or not approval_callback(approval_text, root):
+        return "浏览器搜索被用户或审批策略拒绝"
+
+    if _sync_playwright is None:
+        return (
+            "浏览器搜索不可用：当前 Python 环境未安装 Playwright。"
+            "请先运行 `python -m pip install -e .`，再运行"
+            " `python -m playwright install chromium`。"
+        )
+
+    browser = None
+    try:
+        with _sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/148.0 Safari/537.36"
+                    ),
+                    locale="zh-CN",
+                )
+                page = context.new_page()
+                page.goto(
+                    search_url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout * 1000,
+                )
+                page.wait_for_timeout(1_000)
+                title = page.title()
+                final_url = page.url
+                body = page.inner_text("body")
+                if len(body) > max_chars:
+                    body = body[:max_chars] + "\n[浏览器搜索结果已截断]"
+                return (
+                    f"搜索引擎: {engine}\n"
+                    f"查询: {query.strip()}\n"
+                    f"页面标题: {title}\n"
+                    f"最终 URL: {final_url}\n"
+                    "----\n"
+                    f"{body}"
+                )
+            finally:
+                browser.close()
+    except Exception as exc:
+        detail = str(exc)
+        if "Executable doesn't exist" in detail or "browserType.launch" in detail:
+            detail = (
+                "Playwright 浏览器内核未安装；请运行"
+                " `python -m playwright install chromium`。"
+            )
+        return f"浏览器搜索失败：{detail[:2000]}"
 
 
 def write_file(

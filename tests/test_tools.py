@@ -11,6 +11,7 @@ import pytest
 import ai_harness.tools as tools_module
 from ai_harness.agent import _execute_tool, _handlers_for_workspace
 from ai_harness.tools import (
+    browser_search,
     capture_photo,
     create_directory,
     create_file,
@@ -34,6 +35,80 @@ def test_file_lifecycle(tmp_path: Path):
 
     assert delete_file("nested/example.txt", tmp_path) == "已删除文件: nested/example.txt"
     assert not (tmp_path / "nested/example.txt").exists()
+
+
+def test_browser_search_uses_headless_chromium_and_public_search_url(
+    tmp_path: Path, monkeypatch
+):
+    calls = []
+
+    class FakePage:
+        url = "https://www.baidu.com/s?wd=%E6%B5%8B%E8%AF%95"
+
+        def goto(self, url, **kwargs):
+            calls.append(("goto", url, kwargs))
+
+        def wait_for_timeout(self, milliseconds):
+            calls.append(("wait", milliseconds))
+
+        def title(self):
+            return "测试_百度搜索"
+
+        def inner_text(self, selector):
+            assert selector == "body"
+            return "搜索结果正文"
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):
+            calls.append(("context", kwargs))
+            return FakeContext()
+
+        def close(self):
+            calls.append(("close",))
+
+    class FakeChromium:
+        def launch(self, **kwargs):
+            calls.append(("launch", kwargs))
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, *_args):
+            return False
+
+    approvals = []
+    monkeypatch.setattr(tools_module, "_sync_playwright", lambda: PlaywrightContext())
+    result = browser_search(
+        "测试关键词",
+        workspace_root=tmp_path,
+        approval_callback=lambda action, cwd: approvals.append((action, cwd)) or True,
+    )
+
+    assert "搜索结果正文" in result
+    assert approvals[0][1] == tmp_path.resolve()
+    assert calls[0] == ("launch", {"headless": True})
+    assert calls[1][0] == "context"
+    assert "wd=%E6%B5%8B%E8%AF%95%E5%85%B3%E9%94%AE%E8%AF%8D" in calls[2][1]
+    assert calls[-1] == ("close",)
+
+
+def test_browser_search_requires_approval(tmp_path: Path):
+    result = browser_search(
+        "不应执行",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: False,
+    )
+
+    assert result == "浏览器搜索被用户或审批策略拒绝"
 
 
 def test_create_file_does_not_overwrite(tmp_path: Path):

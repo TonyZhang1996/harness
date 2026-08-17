@@ -14,6 +14,7 @@ AgentSession --- conversation history
                  |
                  +--- workspace and allowed-root resolver
                  +--- file/search/edit tools
+                 +--- browser_search (Playwright headless Chromium)
                  +--- Git inspection tools
                  +--- platform adapter
                         +--- PowerShell / zsh / bash
@@ -22,10 +23,10 @@ AgentSession --- conversation history
 
 ## Components
 
-- `config.py`：从环境变量构建模型配置。
+- `config.py`：从环境变量构建模型配置，并提供 OpenCode Go 的 Chat Completions 连接预设。
 - `model.py`：创建 OpenAI 兼容客户端。
 - `agent.py`：维护对话、调用模型、分发工具并报告事件。
-- `tools.py`：实现路径隔离、文件操作、搜索、Git 检查和命令执行。
+- `tools.py`：实现路径隔离、文件操作、搜索、Git 检查、命令执行和受限的 Playwright 无头浏览器搜索。
 - 命令工具根据系统选择 PowerShell、zsh 或 bash/sh。
 - 摄像头工具通过 FFmpeg 的 Windows DirectShow、macOS AVFoundation 或 Linux V4L2 后端采集单帧，并校验输出文件。
 - `approval.py`：处理 Shell 命令审批策略。
@@ -37,5 +38,7 @@ AgentSession --- conversation history
 ## Trust boundaries
 
 模型输出不被视为可信输入。所有路径均在工具层解析和验证；Shell 命令在执行前通过审批策略；API Key 不传递给命令子进程。工具错误会作为工具结果返回模型，不会伪装成成功。
+
+`browser_search` 是所有 Session 共享的固定工具。它只允许访问百度或 Bing 的公开搜索入口，使用新建的无 Cookie Chromium 上下文，并沿用当前 Session 的审批回调；模型不能通过它访问任意 URL、本地文件或用户浏览器登录状态。系统提示要求遇到当前或外部信息时优先调用该工具，避免每个 Session 临时创建搜索脚本。
 
 `--full-access` 是显式的会话级权限提升：文件系统根目录加入授权范围，敏感文件保护解除，命令审批切换为自动允许。交互模式也可以用 `/permissions` 在 `ask`、`auto`、`never` 和 `full-access` 之间即时切换。每次切换都会重新绑定全部工具的路径边界、敏感文件策略和审批回调；该模式不会持久化到后续会话。

@@ -42,6 +42,19 @@ def test_agent_session_preserves_conversation_history():
     assert session.messages[0]["role"] == "system"
 
 
+def test_every_session_exposes_the_persistent_browser_search_tool():
+    first = AgentSession(client=FakeClient(), model_name="test-model")
+    second = AgentSession(client=FakeClient(), model_name="test-model")
+
+    assert "browser_search" in first.tool_handlers
+    assert "browser_search" in second.tool_handlers
+    assert any(
+        item["function"]["name"] == "browser_search"
+        for item in agent_module.TOOL_DEFINITIONS
+    )
+    assert "MUST call browser_search" in first.messages[0]["content"]
+
+
 def test_agent_inlines_text_attachment(tmp_path):
     attachment = tmp_path / "notes.txt"
     attachment.write_text("附件正文", encoding="utf-8")
@@ -322,6 +335,14 @@ def test_gui_mousewheel_units_support_mac_and_x11(monkeypatch):
     assert gui_module._mousewheel_units(SimpleNamespace(delta=-240, num=None)) == 2
     assert gui_module._mousewheel_units(SimpleNamespace(delta=0, num=4)) == -1
     assert gui_module._mousewheel_units(SimpleNamespace(delta=0, num=5)) == 1
+
+
+def test_gui_mousewheel_speed_is_reduced_without_losing_fractional_events():
+    import ai_harness.gui as gui_module
+
+    assert gui_module._scale_mousewheel_units(-1, 0.0) == (0, -0.2)
+    assert gui_module._scale_mousewheel_units(-1, -0.8) == (-1, 0.0)
+    assert gui_module._scale_mousewheel_units(1, -0.2) == (0, 0.0)
 
 
 def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
