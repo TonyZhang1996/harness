@@ -387,6 +387,9 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
         def request_stop(self):
             self.stop_event.set()
 
+        def repair_tool_call_history(self):
+            return 0
+
         def set_permission_mode(self, mode):
             return mode
 
