@@ -22,7 +22,7 @@ for environment in "$PROJECT_ROOT/.venv" "$PROJECT_ROOT/.venv-mac"; do
   python_bin="$environment/bin/python"
   harness_bin="$environment/bin/ai-harness"
   [[ -x "$python_bin" && -x "$harness_bin" ]] || continue
-  "$python_bin" -c 'import openai' >/dev/null 2>&1 || continue
+  "$python_bin" -c 'import openai, playwright' >/dev/null 2>&1 || continue
   if $needs_gui; then
     "$python_bin" -c 'import PIL, tkinter' >/dev/null 2>&1 || continue
   fi

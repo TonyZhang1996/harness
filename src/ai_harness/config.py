@@ -10,6 +10,31 @@ from pathlib import Path
 
 ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
+OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4-flash"
+OPENCODE_GO_PROVIDER_ALIASES = frozenset({"go", "opencode-go", "opencode_go"})
+
+# These Go models expose the OpenAI-compatible Chat Completions protocol and
+# therefore work with the current tool-calling client without another adapter.
+OPENCODE_GO_CHAT_MODELS = (
+    "glm-5.3",
+    "glm-5.2",
+    "glm-5.1",
+    "kimi-k3",
+    "kimi-k2.7-code",
+    "kimi-k2.6",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "hy3",
+)
+
+
+def is_opencode_go_provider(provider: str | None) -> bool:
+    """Return whether a configured provider name refers to OpenCode Go."""
+    return (provider or "").strip().lower() in OPENCODE_GO_PROVIDER_ALIASES
+
 
 def find_env_file() -> Path | None:
     """Locate configuration consistently across editable and global installs."""
@@ -77,23 +102,39 @@ class ModelConfig:
         env_file = find_env_file()
         if env_file:
             load_env_file(env_file)
-        api_key = (
-            os.getenv("AI_HARNESS_API_KEY")
-            or os.getenv("DEEPSEEK_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-        )
+
+        provider = os.getenv("AI_HARNESS_PROVIDER")
+        go_requested = is_opencode_go_provider(provider)
+        if not provider and os.getenv("OPENCODE_GO_API_KEY"):
+            go_requested = True
+
+        if go_requested:
+            api_key = os.getenv("OPENCODE_GO_API_KEY") or os.getenv("AI_HARNESS_API_KEY")
+        else:
+            api_key = (
+                os.getenv("AI_HARNESS_API_KEY")
+                or os.getenv("DEEPSEEK_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+            )
         if not api_key:
             raise RuntimeError(
-                "请设置 AI_HARNESS_API_KEY、DEEPSEEK_API_KEY 或 OPENAI_API_KEY"
+                "请设置 AI_HARNESS_API_KEY、OPENCODE_GO_API_KEY、DEEPSEEK_API_KEY 或 OPENAI_API_KEY"
             )
 
         base_url = os.getenv("AI_HARNESS_BASE_URL")
-        if base_url is None and os.getenv("DEEPSEEK_API_KEY"):
+        if base_url is None and go_requested:
+            base_url = OPENCODE_GO_BASE_URL
+        elif base_url is None and os.getenv("DEEPSEEK_API_KEY"):
             base_url = "https://api.deepseek.com"
 
         model = os.getenv("AI_HARNESS_MODEL")
         if not model:
-            model = "deepseek-v4-flash" if base_url == "https://api.deepseek.com" else ""
+            if go_requested:
+                model = OPENCODE_GO_DEFAULT_MODEL
+            elif base_url == "https://api.deepseek.com":
+                model = "deepseek-v4-flash"
+            else:
+                model = ""
         if not model:
             raise RuntimeError("请设置 AI_HARNESS_MODEL")
 

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+## 0.5.0 — 2026-08-17
+
+### Web search
+
+- Added the shared `browser_search` tool, backed by Playwright headless Chromium, to every Session.
+- Current/external-information questions are instructed to use the fixed Baidu/Bing search tool instead of creating temporary browser scripts with `run_command`.
+- Added approval handling, public-search-only URL boundaries, browser-result truncation, and Playwright setup guidance.
+
+### Model providers
+
+- Added an OpenCode Go connection preset with automatic endpoint detection and support for its Chat Completions models.
+- Added clickable model selectors that load model IDs from the configured provider's `/models` endpoint.
+
+### Validation
+
+- `66 passed, 1 skipped` in the test suite.
+
 ## 0.4.2 — 2026-08-11
 
 ### GUI

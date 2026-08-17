@@ -17,13 +17,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from PIL import Image, ImageGrab
 
 from . import __version__
 from .agent import AgentPaused, AgentSession
-from .config import load_env_file
+from .config import (
+    OPENCODE_GO_BASE_URL,
+    OPENCODE_GO_CHAT_MODELS,
+    OPENCODE_GO_DEFAULT_MODEL,
+    is_opencode_go_provider,
+    load_env_file,
+)
 
 
 COLORS = {
@@ -58,6 +66,65 @@ PERMISSION_LABELS = {
 
 UI_FONT = "Microsoft YaHei UI" if platform.system() == "Windows" else "TkDefaultFont"
 MAX_RENDERED_HISTORY_ITEMS = 80
+MOUSEWHEEL_SCROLL_FACTOR = 0.2
+MODEL_CATALOG_TIMEOUT = 10.0
+
+
+def _model_catalog_url(api_url: str) -> str:
+    """Derive a provider's model-list endpoint from its configured base URL."""
+    normalized = api_url.strip().rstrip("/")
+    if not normalized:
+        raise ValueError("API URL 不能为空")
+    if normalized.endswith("/models"):
+        return normalized
+    for suffix in ("/chat/completions", "/responses", "/messages"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return f"{normalized}/models"
+
+
+def _parse_model_catalog(payload: Any) -> list[str]:
+    """Extract unique model IDs from common OpenAI-style model responses."""
+    if isinstance(payload, dict):
+        items = payload.get("data", payload.get("models", []))
+    else:
+        items = payload
+    if not isinstance(items, list):
+        raise ValueError("模型列表响应格式不正确")
+
+    model_ids: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            model_id = item.strip()
+        elif isinstance(item, dict):
+            model_id = str(item.get("id", "")).strip()
+        else:
+            model_id = ""
+        if model_id and model_id not in model_ids:
+            model_ids.append(model_id)
+    if not model_ids:
+        raise ValueError("模型列表为空")
+    return model_ids
+
+
+def _fetch_model_catalog(api_url: str, api_key: str) -> list[str]:
+    """Fetch model IDs without exposing credentials in errors or logs."""
+    url = _model_catalog_url(api_url)
+    headers = {"Accept": "application/json"}
+    if api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    request = Request(url, headers=headers, method="GET")
+    try:
+        with urlopen(request, timeout=MODEL_CATALOG_TIMEOUT) as response:
+            payload = json.loads(response.read(2_000_000).decode("utf-8"))
+    except HTTPError as exc:
+        raise RuntimeError(f"获取模型列表失败（HTTP {exc.code}）") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError("获取模型列表失败，请检查 API URL 或网络连接") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("获取模型列表失败，接口返回的不是有效 JSON") from exc
+    return _parse_model_catalog(payload)
 
 
 def _mousewheel_units(event: Any) -> int:
@@ -77,6 +144,13 @@ def _mousewheel_units(event: Any) -> int:
     if button == 5:
         return 1
     return 0
+
+
+def _scale_mousewheel_units(units: int, remainder: float) -> tuple[int, float]:
+    """Reduce wheel speed while preserving fractional movement between events."""
+    scaled = units * MOUSEWHEEL_SCROLL_FACTOR + remainder
+    scroll_units = math.trunc(scaled)
+    return scroll_units, scaled - scroll_units
 
 
 def _app_asset_path(filename: str) -> Path | None:
@@ -232,14 +306,23 @@ class HarnessGUI:
         ).expanduser().resolve()
         if self.config_path.is_file():
             load_env_file(self.config_path)
+        provider = os.getenv("AI_HARNESS_PROVIDER")
+        go_configured = is_opencode_go_provider(provider) or (
+            not provider and bool(os.getenv("OPENCODE_GO_API_KEY"))
+        )
         self.api_key = (
-            os.getenv("AI_HARNESS_API_KEY")
+            (os.getenv("OPENCODE_GO_API_KEY") if go_configured else None)
+            or os.getenv("AI_HARNESS_API_KEY")
             or os.getenv("DEEPSEEK_API_KEY")
             or os.getenv("OPENAI_API_KEY")
             or ""
         )
-        self.api_url = os.getenv("AI_HARNESS_BASE_URL") or "https://api.deepseek.com"
-        self.model_name = model_name or os.getenv("AI_HARNESS_MODEL") or "deepseek-v4-flash"
+        self.api_url = os.getenv("AI_HARNESS_BASE_URL") or (
+            OPENCODE_GO_BASE_URL if go_configured else "https://api.deepseek.com"
+        )
+        self.model_name = model_name or os.getenv("AI_HARNESS_MODEL") or (
+            OPENCODE_GO_DEFAULT_MODEL if go_configured else "deepseek-v4-flash"
+        )
         self.state_path = Path(
             state_path or Path.home() / ".ai-harness" / "gui-state.json"
         ).expanduser().resolve()
@@ -263,6 +346,9 @@ class HarnessGUI:
         self._body_labels: list[tk.Label] = []
         self._active_tool_cards: dict[str, dict[str, Any]] = {}
         self._wrap_refresh_scheduled = False
+        self._mousewheel_remainders: dict[str, float] = {}
+        self._model_catalog_loading = False
+        self._model_catalog_callbacks: dict[str, Callable[[list[str]], None]] = {}
 
         self._load_state()
         self.root.title(f"AI Harness {__version__} · 张杰")
@@ -290,6 +376,7 @@ class HarnessGUI:
         self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._on_mousewheel, add="+")
         self.root.bind_all("<Button-5>", self._on_mousewheel, add="+")
+        self._bind_mousewheel(self.project_tree)
         self._refresh_project_list()
         self._refresh_session_list()
         self._render_current_session()
@@ -670,20 +757,19 @@ class HarnessGUI:
         model_row = tk.Frame(controls, bg=COLORS["sidebar_alt"])
         model_row.pack(fill="x")
         tk.Label(model_row, text="模型", width=5, anchor="w", bg=COLORS["sidebar_alt"], fg=COLORS["subtle"], font=(UI_FONT, 8)).pack(side="left")
-        self.model_entry = tk.Entry(
+        initial_models = list(OPENCODE_GO_CHAT_MODELS)
+        if self.model_name and self.model_name not in initial_models:
+            initial_models.insert(0, self.model_name)
+        self.model_entry = ttk.Combobox(
             model_row,
             textvariable=self.model_var,
+            values=initial_models,
+            state="normal",
+            style="Dark.TCombobox",
             width=18,
-            bg=COLORS["panel"],
-            fg=COLORS["text"],
-            insertbackground=COLORS["text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["accent"],
-            font=(UI_FONT, 9),
+            postcommand=self._request_model_catalog,
         )
-        self.model_entry.pack(side="left", fill="x", expand=True, ipady=6)
+        self.model_entry.pack(side="left", fill="x", expand=True, ipady=5)
 
         footer = tk.Frame(self.sidebar, bg=COLORS["sidebar"])
         footer.pack(fill="x", padx=18, pady=(0, 13))
@@ -882,18 +968,39 @@ class HarnessGUI:
         container_path = str(container)
         return widget_path == container_path or widget_path.startswith(container_path + ".")
 
+    def _bind_mousewheel(self, widget: tk.Misc) -> None:
+        """Handle scrolling before native widget class bindings can run."""
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, self._on_mousewheel, add="+")
+
+    def _bind_mousewheel_tree(self, widget: tk.Misc) -> None:
+        """Install the early wheel binding on a canvas and all content widgets."""
+        self._bind_mousewheel(widget)
+        for child in widget.winfo_children():
+            self._bind_mousewheel_tree(child)
+
     def _on_mousewheel(self, event: tk.Event[Any]) -> str | None:
         units = _mousewheel_units(event)
         if not units:
             return None
         widget = getattr(event, "widget", None)
         if widget is not None and self._widget_is_inside(widget, self.chat_canvas):
-            self.chat_canvas.yview_scroll(units, "units")
+            self._scroll_with_mousewheel(self.chat_canvas, units)
             return "break"
         if widget is not None and self._widget_is_inside(widget, self.project_tree):
-            self.project_tree.yview_scroll(units, "units")
+            self._scroll_with_mousewheel(self.project_tree, units)
             return "break"
         return None
+
+    def _scroll_with_mousewheel(self, widget: tk.Misc, units: int) -> None:
+        """Scroll at a reduced rate without dropping small trackpad movements."""
+        key = str(widget)
+        scroll_units, remainder = _scale_mousewheel_units(
+            units, self._mousewheel_remainders.get(key, 0.0)
+        )
+        self._mousewheel_remainders[key] = remainder
+        if scroll_units:
+            widget.yview_scroll(scroll_units, "units")
 
     def _refresh_project_list(self) -> None:
         self._refresh_project_tree()
@@ -1275,6 +1382,7 @@ class HarnessGUI:
         self.composer_project.configure(text=self.workspace.name)
         self._refresh_composer_state()
         self._refresh_session_status()
+        self._bind_mousewheel_tree(self.chat_inner)
 
     def _show_welcome(self) -> None:
         hero = tk.Frame(self.chat_inner, bg=COLORS["app"])
@@ -1395,6 +1503,8 @@ class HarnessGUI:
         )
         body_label.pack(fill="x", pady=(0, 13))
         self._body_labels.append(body_label)
+        if not self._rendering_history:
+            self._bind_mousewheel_tree(wrapper)
         self._schedule_card_wrap_refresh()
         self.root.after_idle(self._scroll_chat_to_bottom)
         self.root.after(80, self._scroll_chat_to_bottom)
@@ -1600,6 +1710,25 @@ class HarnessGUI:
                         self._show_approval_dialog(message)
                     else:
                         self.approval_queue.append(message)
+                elif kind == "model_catalog":
+                    self._model_catalog_loading = False
+                    request_id = str(message.get("request_id", ""))
+                    callback = self._model_catalog_callbacks.pop(request_id, None)
+                    models = message.get("models", [])
+                    if callback is not None and isinstance(models, list):
+                        callback([str(model) for model in models])
+                    self._set_status(
+                        f"已加载 {len(models)} 个模型",
+                        COLORS["success"],
+                    )
+                elif kind == "model_catalog_error":
+                    self._model_catalog_loading = False
+                    request_id = str(message.get("request_id", ""))
+                    self._model_catalog_callbacks.pop(request_id, None)
+                    self._set_status(
+                        str(message.get("message", "获取模型列表失败")),
+                        COLORS["danger"],
+                    )
                 elif kind == "approval_review":
                     session_id = (
                         str(message.get("session_id", ""))
@@ -1975,6 +2104,74 @@ class HarnessGUI:
                 return
         self._set_status(f"权限：{PERMISSION_LABELS[mode]}", COLORS["warning"] if mode == "full-access" else COLORS["success"])
 
+    @staticmethod
+    def _model_choices(models: list[str] | tuple[str, ...], current: str = "") -> list[str]:
+        """Keep the current value visible while de-duplicating provider models."""
+        choices = list(dict.fromkeys(model.strip() for model in models if model.strip()))
+        current = current.strip()
+        if current and current not in choices:
+            choices.insert(0, current)
+        return choices
+
+    def _request_model_catalog(
+        self,
+        target: ttk.Combobox | None = None,
+        api_url: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        """Start a background model-list request before a dropdown is opened."""
+        if self.closing or self._model_catalog_loading:
+            return
+        destination = target or self.model_entry
+        endpoint = (api_url if api_url is not None else self.api_url).strip()
+        key = api_key if api_key is not None else self.api_key
+        if not endpoint:
+            self._set_status("API URL 为空，无法获取模型列表", COLORS["danger"])
+            return
+
+        try:
+            _model_catalog_url(endpoint)
+        except ValueError as exc:
+            self._set_status(str(exc), COLORS["danger"])
+            return
+
+        request_id = uuid.uuid4().hex
+        self._model_catalog_loading = True
+
+        def apply_models(models: list[str]) -> None:
+            try:
+                current = destination.get().strip()
+                destination.configure(values=self._model_choices(models, current))
+                destination.event_generate("<<ModelCatalogUpdated>>", when="tail")
+            except tk.TclError:
+                # The connection dialog may have been closed while the request ran.
+                pass
+
+        self._model_catalog_callbacks[request_id] = apply_models
+        self._set_status("正在获取模型列表…", COLORS["muted"])
+        threading.Thread(
+            target=self._fetch_model_catalog_worker,
+            args=(request_id, endpoint, key),
+            daemon=True,
+        ).start()
+
+    def _fetch_model_catalog_worker(
+        self,
+        request_id: str,
+        api_url: str,
+        api_key: str,
+    ) -> None:
+        try:
+            models = _fetch_model_catalog(api_url, api_key)
+        except Exception as exc:
+            self.event_queue.put(
+                ("model_catalog_error", {"request_id": request_id, "message": str(exc)})
+            )
+            return
+        self.event_queue.put(
+            ("model_catalog", {"request_id": request_id, "models": models})
+        )
+
     def open_connection_settings(self) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title("模型连接设置")
@@ -1999,27 +2196,77 @@ class HarnessGUI:
         url_var = tk.StringVar(value=self.api_url or "https://api.deepseek.com")
         model_var = tk.StringVar(value=self.model_name or "deepseek-v4-flash")
 
-        def field(label: str, variable: tk.StringVar, *, secret: bool = False) -> tk.Entry:
+        def field(
+            label: str,
+            variable: tk.StringVar,
+            *,
+            secret: bool = False,
+            combo_values: list[str] | tuple[str, ...] | None = None,
+        ) -> Any:
             tk.Label(body, text=label, bg=COLORS["app"], fg=COLORS["muted"], font=(UI_FONT, 9)).pack(anchor="w", pady=(0, 5))
-            entry = tk.Entry(
-                body,
-                textvariable=variable,
-                show="●" if secret else "",
-                bg=COLORS["panel"],
-                fg=COLORS["text"],
-                insertbackground=COLORS["accent"],
-                relief="flat",
-                highlightthickness=1,
-                highlightbackground=COLORS["border"],
-                highlightcolor=COLORS["accent"],
-                font=(UI_FONT, 10),
-            )
-            entry.pack(fill="x", ipady=8, pady=(0, 13))
+            if combo_values is not None:
+                entry = ttk.Combobox(
+                    body,
+                    textvariable=variable,
+                    values=self._model_choices(combo_values, variable.get()),
+                    state="normal",
+                    style="Dark.TCombobox",
+                )
+                entry.pack(fill="x", ipady=6, pady=(0, 13))
+            else:
+                entry = tk.Entry(
+                    body,
+                    textvariable=variable,
+                    show="●" if secret else "",
+                    bg=COLORS["panel"],
+                    fg=COLORS["text"],
+                    insertbackground=COLORS["accent"],
+                    relief="flat",
+                    highlightthickness=1,
+                    highlightbackground=COLORS["border"],
+                    highlightcolor=COLORS["accent"],
+                    font=(UI_FONT, 10),
+                )
+                entry.pack(fill="x", ipady=8, pady=(0, 13))
             return entry
 
         key_entry = field("API Key", key_var, secret=True)
         field("API URL", url_var)
-        field("模型", model_var)
+        model_entry = field("模型", model_var, combo_values=OPENCODE_GO_CHAT_MODELS)
+        model_entry.configure(
+            postcommand=lambda: self._request_model_catalog(
+                model_entry,
+                url_var.get(),
+                key_var.get(),
+            )
+        )
+
+        preset_row = tk.Frame(body, bg=COLORS["app"])
+        preset_row.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            preset_row,
+            text="当前 Harness 可直接使用 Go 的 Chat Completions 模型："
+            + "、".join(OPENCODE_GO_CHAT_MODELS),
+            bg=COLORS["app"],
+            fg=COLORS["subtle"],
+            justify="left",
+            wraplength=560,
+            font=(UI_FONT, 8),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        def use_opencode_go_preset() -> None:
+            url_var.set(OPENCODE_GO_BASE_URL)
+            model_var.set(OPENCODE_GO_DEFAULT_MODEL)
+            if not key_var.get().strip():
+                key_var.set(os.getenv("OPENCODE_GO_API_KEY", ""))
+            key_entry.focus_set()
+
+        ttk.Button(
+            preset_row,
+            text="OpenCode Go 预设",
+            style="Ghost.TButton",
+            command=use_opencode_go_preset,
+        ).pack(side="right", anchor="n")
 
         actions = tk.Frame(body, bg=COLORS["app"])
         actions.pack(fill="x", pady=(4, 0))
@@ -2049,7 +2296,13 @@ class HarnessGUI:
 
     def _save_connection_values(self, api_key: str, api_url: str, model: str) -> None:
         """Persist connection settings while preserving unrelated env entries."""
-        managed = {"AI_HARNESS_API_KEY", "AI_HARNESS_BASE_URL", "AI_HARNESS_MODEL"}
+        managed = {
+            "AI_HARNESS_API_KEY",
+            "AI_HARNESS_BASE_URL",
+            "AI_HARNESS_MODEL",
+            "AI_HARNESS_PROVIDER",
+            "OPENCODE_GO_API_KEY",
+        }
         kept_lines: list[str] = []
         if self.config_path.is_file():
             for raw_line in self.config_path.read_text(encoding="utf-8").splitlines():
@@ -2075,6 +2328,9 @@ class HarnessGUI:
         self.api_url = api_url
         self.model_name = model
         self.model_var.set(model)
+        self.model_entry.configure(
+            values=self._model_choices(list(self.model_entry.cget("values")), model)
+        )
         os.environ["AI_HARNESS_API_KEY"] = api_key
         os.environ["AI_HARNESS_BASE_URL"] = api_url
         os.environ["AI_HARNESS_MODEL"] = model

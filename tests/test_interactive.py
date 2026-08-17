@@ -42,6 +42,19 @@ def test_agent_session_preserves_conversation_history():
     assert session.messages[0]["role"] == "system"
 
 
+def test_every_session_exposes_the_persistent_browser_search_tool():
+    first = AgentSession(client=FakeClient(), model_name="test-model")
+    second = AgentSession(client=FakeClient(), model_name="test-model")
+
+    assert "browser_search" in first.tool_handlers
+    assert "browser_search" in second.tool_handlers
+    assert any(
+        item["function"]["name"] == "browser_search"
+        for item in agent_module.TOOL_DEFINITIONS
+    )
+    assert "MUST call browser_search" in first.messages[0]["content"]
+
+
 def test_agent_inlines_text_attachment(tmp_path):
     attachment = tmp_path / "notes.txt"
     attachment.write_text("附件正文", encoding="utf-8")
@@ -324,6 +337,14 @@ def test_gui_mousewheel_units_support_mac_and_x11(monkeypatch):
     assert gui_module._mousewheel_units(SimpleNamespace(delta=0, num=5)) == 1
 
 
+def test_gui_mousewheel_speed_is_reduced_without_losing_fractional_events():
+    import ai_harness.gui as gui_module
+
+    assert gui_module._scale_mousewheel_units(-1, 0.0) == (0, -0.2)
+    assert gui_module._scale_mousewheel_units(-1, -0.8) == (-1, 0.0)
+    assert gui_module._scale_mousewheel_units(1, -0.2) == (0, 0.0)
+
+
 def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
     """Two Sessions can run agent turns in parallel with independent history."""
     tkinter = pytest.importorskip("tkinter")
@@ -336,8 +357,10 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
     import ai_harness.gui as gui_module
     from ai_harness.gui import HarnessGUI
 
-    barrier = threading.Barrier(2)
+    both_started = threading.Event()
+    release_workers = threading.Event()
     started_tasks: list[str] = []
+    started_lock = threading.Lock()
 
     class FakeSession:
         def __init__(self, **kwargs):
@@ -347,8 +370,12 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
             self.event_callback = kwargs.get("event_callback")
 
         def ask(self, task, attachments=None):
-            started_tasks.append(task)
-            barrier.wait(timeout=5)
+            with started_lock:
+                started_tasks.append(task)
+                if len(started_tasks) == 2:
+                    both_started.set()
+            if not release_workers.wait(timeout=10):
+                raise AssertionError("并发测试 worker 未被释放")
             if self.event_callback is not None:
                 self.event_callback("tool_start", "执行工具")
                 self.event_callback("tool_result", "工具结果")
@@ -359,6 +386,9 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
 
         def request_stop(self):
             self.stop_event.set()
+
+        def repair_tool_call_history(self):
+            return 0
 
         def set_permission_mode(self, mode):
             return mode
@@ -384,10 +414,13 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
         gui.prompt.insert("1.0", "任务B")
         gui.send_message()
 
+        assert both_started.wait(timeout=10), "两个 Session 未能同时启动"
+
         # Both Sessions must be busy at the same time (true parallelism).
         assert gui._runtime(session_a_id)["busy"] is True
         assert gui._runtime(session_b_id)["busy"] is True
 
+        release_workers.set()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             gui._drain_events()
@@ -417,6 +450,7 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
         bodies = [item["body"] for item in gui._current_record()["items"]]
         assert "回答:任务A" in bodies
     finally:
+        release_workers.set()
         root.destroy()
 
 

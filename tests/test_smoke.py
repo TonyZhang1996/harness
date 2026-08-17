@@ -1,11 +1,16 @@
 from ai_harness import __version__
 from ai_harness.cli import build_parser
-from ai_harness.gui import HarnessGUI, launch_gui
+from ai_harness.gui import (
+    HarnessGUI,
+    _model_catalog_url,
+    _parse_model_catalog,
+    launch_gui,
+)
 import inspect
 
 
 def test_package_has_version():
-    assert __version__ == "0.4.2"
+    assert __version__ == "0.5.0"
 
 
 def test_parser_accepts_task():
@@ -36,6 +41,27 @@ def test_gui_defaults_to_auto_review():
 
     assert gui_default == "auto"
     assert launch_default == "auto"
+
+
+def test_model_catalog_url_uses_provider_base_url():
+    assert _model_catalog_url("https://opencode.ai/zen/go/v1") == (
+        "https://opencode.ai/zen/go/v1/models"
+    )
+    assert _model_catalog_url(
+        "https://opencode.ai/zen/go/v1/chat/completions"
+    ) == "https://opencode.ai/zen/go/v1/models"
+
+
+def test_model_catalog_parser_extracts_unique_ids():
+    assert _parse_model_catalog(
+        {
+            "data": [
+                {"id": "kimi-k3"},
+                {"id": "deepseek-v4-flash"},
+                {"id": "kimi-k3"},
+            ]
+        }
+    ) == ["kimi-k3", "deepseek-v4-flash"]
 
 
 def test_project_order_can_be_changed_without_losing_records():

@@ -7,6 +7,7 @@ AI Harness 是一个安全、跨平台、可扩展的本地编码 Agent。它通
 - 连续对话与上下文记忆
 - OpenAI 兼容模型端点，默认兼容 DeepSeek 配置
 - 文件读取、目录浏览、全文搜索和精确文本编辑
+- 内置 Playwright 无头 Chromium 公网搜索，所有 Session 共用同一浏览器工具
 - 文件与空目录的创建、修改和安全删除
 - Git 状态与差异读取
 - Windows、macOS、Linux 摄像头拍照并保存为 JPEG/PNG
@@ -24,6 +25,7 @@ cd /path/to/harness
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
+python -m playwright install chromium
 cp .env.example .env
 ```
 
@@ -34,6 +36,7 @@ cd C:\path\to\harness
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
+python -m playwright install chromium
 Copy-Item .env.example .env
 ```
 
@@ -138,6 +141,16 @@ harness --quiet-tools
 
 ## 模型配置
 
+OpenCode Go：
+
+```env
+OPENCODE_GO_API_KEY="你的 OpenCode Go API Key"
+AI_HARNESS_PROVIDER="opencode-go"  # 可省略；检测到 OPENCODE_GO_API_KEY 时会自动启用
+AI_HARNESS_MODEL="deepseek-v4-flash"
+```
+
+当前版本可直接使用 Go 的 Chat Completions 模型：`glm-5.3`、`glm-5.2`、`glm-5.1`、`kimi-k3`、`kimi-k2.7-code`、`kimi-k2.6`、`deepseek-v4-pro`、`deepseek-v4-flash`、`mimo-v2.5`、`mimo-v2.5-pro` 和 `hy3`。API URL 会自动使用 `https://opencode.ai/zen/go/v1`，也可以通过 `AI_HARNESS_BASE_URL` 覆盖。
+
 DeepSeek：
 
 ```env
@@ -203,13 +216,17 @@ GUI 每次启动默认使用“帮我批准”，权限下拉框采用深色显�
 
 “模型连接”窗口提供 API Key、API URL 和模型输入框。DeepSeek URL 默认是 `https://api.deepseek.com`，默认模型是 `deepseek-v4-flash`；配置保存在用户目录的 `~/.ai-harness/.env`。
 
+“模型”现在是可下拉选择的输入框。点击下拉箭头后，GUI 会从当前 API URL 自动请求 `/models`，显示接口返回的全部模型 ID；列表请求在后台执行，不会阻塞界面。若接口不支持模型列表，仍可以手动输入模型 ID。
+
+需要当前或外部信息时，任意 Session 都会使用内置的 `browser_search` 工具，通过 Playwright 无头 Chromium 搜索百度或 Bing 公共网页。工具只接受搜索关键词，不允许模型直接导航任意 URL；首次使用前需在运行 AI Harness 的同一个 Python 环境中执行 `python -m playwright install chromium`。
+
 ## 0.4.1 修复
 
 - 修复 macOS 上建议卡片文字与背景颜色接近、导致内容显示为白块的问题。
 - GUI 启动时恢复上次使用的工作区和当前 Session。
 - 修复 macOS 应用打包后图标等资源的查找路径。
 
-## 0.4.2 更新
+## 0.5.0 更新
 
 - 支持项目树和对话区域跨平台鼠标滚轮滚动。
 - 支持右键删除 Session、移除项目（不会删除磁盘文件）。
@@ -219,8 +236,10 @@ GUI 每次启动默认使用“帮我批准”，权限下拉框采用深色显�
 - App 使用统一的兔子图标，并修复 macOS 打包后的 Tk 运行时资源和启动问题。
 - App 退出或网络中断导致工具调用历史不完整时，自动修复会话并允许继续运行。
 - 模型遇到临时网络压缩错误时自动重试一次。
-- 增加工具进度、会话恢复和模型重试相关测试；当前测试结果为 58 项通过。
+- 支持 OpenCode Go 订阅及其 Chat Completions 模型。
+- GUI 模型选择框支持从当前 API 的 `/models` 接口动态加载模型列表。
+- 增加工具进度、会话恢复、模型重试、OpenCode Go 配置和动态模型列表相关测试；当前测试结果为 66 项通过、1 项跳过。
 
 ## 当前边界
 
-AI Harness 0.4.2 是一个支持 Windows、macOS 和 Linux 的本地编码 Agent MVP，并提供 Tkinter 桌面 GUI。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。
+AI Harness 0.5.0 是一个支持 Windows、macOS 和 Linux 的本地编码 Agent MVP，并提供 Tkinter 桌面 GUI。真正的二进制办公文件生成、模型智能路由、上下文压缩、沙箱容器和分布式执行属于后续版本范围。
