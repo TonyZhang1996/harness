@@ -357,8 +357,10 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
     import ai_harness.gui as gui_module
     from ai_harness.gui import HarnessGUI
 
-    barrier = threading.Barrier(2)
+    both_started = threading.Event()
+    release_workers = threading.Event()
     started_tasks: list[str] = []
+    started_lock = threading.Lock()
 
     class FakeSession:
         def __init__(self, **kwargs):
@@ -368,8 +370,12 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
             self.event_callback = kwargs.get("event_callback")
 
         def ask(self, task, attachments=None):
-            started_tasks.append(task)
-            barrier.wait(timeout=5)
+            with started_lock:
+                started_tasks.append(task)
+                if len(started_tasks) == 2:
+                    both_started.set()
+            if not release_workers.wait(timeout=10):
+                raise AssertionError("并发测试 worker 未被释放")
             if self.event_callback is not None:
                 self.event_callback("tool_start", "执行工具")
                 self.event_callback("tool_result", "工具结果")
@@ -405,10 +411,13 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
         gui.prompt.insert("1.0", "任务B")
         gui.send_message()
 
+        assert both_started.wait(timeout=10), "两个 Session 未能同时启动"
+
         # Both Sessions must be busy at the same time (true parallelism).
         assert gui._runtime(session_a_id)["busy"] is True
         assert gui._runtime(session_b_id)["busy"] is True
 
+        release_workers.set()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             gui._drain_events()
@@ -438,6 +447,7 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
         bodies = [item["body"] for item in gui._current_record()["items"]]
         assert "回答:任务A" in bodies
     finally:
+        release_workers.set()
         root.destroy()
 
 
