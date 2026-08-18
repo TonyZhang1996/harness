@@ -450,6 +450,44 @@ def test_agent_stops_repeated_browser_search_failures(tmp_path):
     assert "系统已停止重复调用" in session.messages[-1]["content"]
 
 
+def test_agent_limits_successful_browser_searches_per_turn(tmp_path):
+    responses = [
+        SimpleNamespace(
+            content=None,
+            tool_calls=[
+                SimpleNamespace(
+                    id=f"browser-call-{index}",
+                    function=SimpleNamespace(
+                        name="browser_search",
+                        arguments=f'{{"query":"测试 {index}"}}',
+                    ),
+                )
+            ],
+        )
+        for index in range(1, 5)
+    ]
+    responses.append(SimpleNamespace(content="已根据搜索结果回答。", tool_calls=None))
+    browser_calls = []
+
+    class RepeatingBrowserCompletions:
+        def create(self, **_kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=responses.pop(0))])
+
+    session = AgentSession(
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=RepeatingBrowserCompletions())
+        ),
+        workspace=tmp_path,
+    )
+    session.tool_handlers["browser_search"] = (
+        lambda **kwargs: browser_calls.append(kwargs) or "搜索结果"
+    )
+
+    assert session.ask("搜索测试") == "已根据搜索结果回答。"
+    assert len(browser_calls) == session.MAX_BROWSER_SEARCH_CALLS_PER_TURN
+    assert "达到 3 次上限" in session.messages[-2]["content"]
+
+
 def test_agent_repairs_interrupted_tool_call_before_resume():
     tool_call = SimpleNamespace(
         id="call-interrupted",
@@ -572,22 +610,187 @@ def test_gui_mousewheel_units_support_mac_and_x11(monkeypatch):
     assert gui_module._mousewheel_units(SimpleNamespace(delta=0, num=5)) == 1
 
 
-def test_gui_mousewheel_preserves_high_resolution_events_and_uses_pixel_distance(monkeypatch):
+def test_gui_mousewheel_normalizes_high_resolution_windows_events(monkeypatch):
     import ai_harness.gui as gui_module
 
     monkeypatch.setattr(gui_module.platform, "system", lambda: "Windows")
-    assert gui_module._mousewheel_units(SimpleNamespace(delta=60, num=None)) == -0.5
-    assert gui_module._mousewheel_units(SimpleNamespace(delta=240, num=None)) == -2.0
-    assert gui_module._mousewheel_scroll_delta((0.2, 0.7), 800, -1) == pytest.approx(-0.03)
-    assert gui_module._mousewheel_scroll_delta((0.0, 1.0), 800, -1) == 0.0
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=60, num=None)) == -1
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=240, num=None)) == -2
 
 
-def test_gui_mousewheel_target_is_clamped_to_content_bounds():
+def test_gui_decodes_tk9_touchpad_scroll_delta():
+    import ai_harness.gui as gui_module
+
+    assert gui_module._touchpad_scroll_units(SimpleNamespace(delta=12)) == pytest.approx(-0.25)
+    assert gui_module._touchpad_scroll_units(SimpleNamespace(delta=0xFFF4)) == pytest.approx(0.25)
+
+
+def test_gui_mousewheel_coalesces_bursts_into_one_canvas_repaint():
     from ai_harness.gui import HarnessGUI
 
-    assert HarnessGUI._clamp_mousewheel_target(-0.2, 0.25) == 0.0
-    assert HarnessGUI._clamp_mousewheel_target(0.5, 0.25) == pytest.approx(0.5)
-    assert HarnessGUI._clamp_mousewheel_target(0.9, 0.25) == pytest.approx(0.75)
+    class FakeRoot:
+        def __init__(self):
+            self.callbacks = []
+
+        def after(self, delay, callback, widget):
+            self.callbacks.append((delay, callback, widget))
+            return "after-1"
+
+    class FakeScrollable:
+        def __init__(self):
+            self.moves = []
+
+        def __str__(self):
+            return ".chat"
+
+        def yview(self):
+            return (0.2, 0.7)
+
+        def winfo_height(self):
+            return 800
+
+        def yview_moveto(self, target):
+            self.moves.append(target)
+
+    gui = HarnessGUI.__new__(HarnessGUI)
+    gui.root = FakeRoot()
+    widget = FakeScrollable()
+
+    gui._scroll_with_mousewheel(widget, -1)
+    gui._scroll_with_mousewheel(widget, -1)
+
+    assert len(gui.root.callbacks) == 1
+    _, callback, callback_widget = gui.root.callbacks.pop()
+    callback(callback_widget)
+
+    assert widget.moves == [pytest.approx(0.14)]
+
+
+def test_gui_mousewheel_routes_nested_widgets_to_their_scroll_container():
+    from ai_harness.gui import HarnessGUI
+
+    class FakeWidget:
+        def __init__(self, path):
+            self.path = path
+
+        def __str__(self):
+            return self.path
+
+    gui = HarnessGUI.__new__(HarnessGUI)
+    gui.root = SimpleNamespace()
+    gui.chat_canvas = FakeWidget(".chat")
+    gui.project_tree = FakeWidget(".sidebar.tree")
+    calls = []
+    gui._scroll_with_mousewheel = lambda widget, units: calls.append((widget, units))
+
+    result = gui._on_mousewheel(
+        SimpleNamespace(
+            delta=1,
+            num=None,
+            widget=FakeWidget(".chat.message.body"),
+        )
+    )
+
+    assert result == "break"
+    assert calls == [(gui.chat_canvas, -1)]
+
+
+def test_gui_mousewheel_uses_live_pointer_when_macos_targets_focused_widget():
+    from ai_harness.gui import HarnessGUI
+
+    class FakeWidget:
+        def __init__(self, path):
+            self.path = path
+
+        def __str__(self):
+            return self.path
+
+    chat_child = FakeWidget(".chat.message.body")
+
+    class FakeRoot:
+        def winfo_containing(self, x, y):
+            return chat_child if (x, y) == (700, 400) else None
+
+        def winfo_pointerx(self):
+            return 700
+
+        def winfo_pointery(self):
+            return 400
+
+    gui = HarnessGUI.__new__(HarnessGUI)
+    gui.root = FakeRoot()
+    gui.chat_canvas = FakeWidget(".chat")
+    gui.project_tree = FakeWidget(".sidebar.tree")
+
+    target = gui._mousewheel_target(
+        SimpleNamespace(
+            widget=FakeWidget(".composer.prompt"),
+            x_root=0,
+            y_root=0,
+        )
+    )
+
+    assert target is gui.chat_canvas
+
+
+def test_gui_mousewheel_binds_each_concrete_widget_once():
+    from ai_harness.gui import HarnessGUI, MOUSEWHEEL_SEQUENCES, TOUCHPAD_SCROLL_SEQUENCE
+
+    class FakeWidget:
+        def __init__(self):
+            self.bindings = []
+
+        def bind(self, sequence, callback, add=None):
+            self.bindings.append((sequence, callback, add))
+
+    gui = HarnessGUI.__new__(HarnessGUI)
+    gui._mousewheel_sequences = [*MOUSEWHEEL_SEQUENCES, TOUCHPAD_SCROLL_SEQUENCE]
+    widget = FakeWidget()
+
+    gui._bind_mousewheel(widget)
+    gui._bind_mousewheel(widget)
+
+    assert [binding[0] for binding in widget.bindings] == [
+        "<MouseWheel>",
+        "<Button-4>",
+        "<Button-5>",
+        "<TouchpadScroll>",
+    ]
+    assert all(binding[2] == "+" for binding in widget.bindings)
+
+
+def test_gui_output_autoscroll_settles_but_manual_wheel_cancels_it():
+    from ai_harness.gui import HarnessGUI
+
+    class FakeRoot:
+        def __init__(self):
+            self.idle = []
+            self.delayed = []
+
+        def after_idle(self, callback, *args):
+            self.idle.append((callback, args))
+
+        def after(self, delay, callback, *args):
+            self.delayed.append((delay, callback, args))
+
+    gui = HarnessGUI.__new__(HarnessGUI)
+    gui.root = FakeRoot()
+    gui.closing = False
+    scrolls = []
+    gui._scroll_chat_to_bottom = lambda: scrolls.append("bottom")
+
+    gui._schedule_chat_to_bottom()
+    callback, args = gui.root.idle.pop()
+    callback(*args)
+
+    assert scrolls == ["bottom"]
+    assert len(gui.root.delayed) == 1
+
+    gui._cancel_chat_autoscroll()
+    _, callback, args = gui.root.delayed.pop()
+    callback(*args)
+
+    assert scrolls == ["bottom"]
 
 
 def test_connection_change_defers_busy_session_rebuild():

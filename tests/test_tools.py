@@ -110,6 +110,55 @@ def test_browser_search_uses_headless_chromium_and_public_search_url(
     assert calls[-1] == ("close",)
 
 
+def test_browser_search_reuses_a_recent_identical_result(tmp_path: Path, monkeypatch):
+    for environment_name in tools_module.BROWSER_PROXY_ENV_NAMES:
+        monkeypatch.delenv(environment_name, raising=False)
+    calls = []
+
+    def fake_search_once(
+        sync_playwright, query, engine, max_chars, timeout, proxy, image_search
+    ):
+        calls.append((query, engine, timeout))
+        return "搜索引擎: baidu\n----\n缓存结果"
+
+    monkeypatch.setattr(tools_module, "_sync_playwright", lambda: object())
+    monkeypatch.setattr(tools_module, "_browser_search_once", fake_search_once)
+
+    first = browser_search(
+        "缓存关键词",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: True,
+    )
+    second = browser_search(
+        "  缓存关键词  ",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: True,
+    )
+
+    assert "缓存结果" in first
+    assert "已复用 60 秒内" in second
+    assert calls == [("缓存关键词", "baidu", 15)]
+
+
+def test_browser_search_answers_known_opencode_go_url_without_network(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        tools_module,
+        "_browser_search_once",
+        lambda *_args, **_kwargs: pytest.fail("不应启动浏览器"),
+    )
+
+    result = browser_search(
+        "opencode go 订阅 URL 地址",
+        workspace_root=tmp_path,
+        approval_callback=lambda *_args: pytest.fail("不应请求网络审批"),
+    )
+
+    assert "https://opencode.ai/zen/go/v1" in result
+    assert "不是购买或账单页面" in result
+
+
 def test_browser_search_falls_back_to_baidu_after_bing_network_failure(
     tmp_path: Path, monkeypatch
 ):

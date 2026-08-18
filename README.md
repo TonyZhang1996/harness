@@ -259,7 +259,7 @@ GUI 每次启动默认使用“帮我批准”，权限下拉框采用深色显�
 
 “模型”现在是可下拉选择的输入框。点击下拉箭头后，GUI 会从当前 API URL 自动请求 `/models`，显示接口返回的全部模型 ID；列表请求在后台执行，不会阻塞界面。若接口不支持模型列表，仍可以手动输入模型 ID。
 
-需要当前或外部信息时，任意 Session 都会使用内置的 `browser_search` 工具，通过 Playwright 无头 Chromium 搜索百度或 Bing 公共网页。工具只接受搜索关键词，不允许模型直接导航任意 URL。首次使用前需在运行 AI Harness 的同一个 Python 环境中执行 `python -m playwright install chromium`；如果工具提示缺少 Playwright，请严格使用错误信息中显示的解释器路径执行安装命令，不要改用可能指向其他环境的 `python` 或 `py`。
+需要当前或外部信息时，任意 Session 都会使用内置的 `browser_search` 工具，通过 Playwright 无头 Chromium 搜索百度或 Bing 公共网页。涉及 AI Harness 自身配置、供应商预设、端点和文档的问题会优先从内置配置和本地源码回答，避免不必要的外网搜索；例如 OpenCode Go API URL 会直接从当前版本配置返回。工具默认搜索超时为 15 秒、单次最多 30 秒，同一进程 60 秒内的相同查询会复用结果，单个用户回合最多执行 3 次网页搜索。工具只接受搜索关键词，不允许模型直接导航任意 URL。首次使用前需在运行 AI Harness 的同一个 Python 环境中执行 `python -m playwright install chromium`；如果工具提示缺少 Playwright，请严格使用错误信息中显示的解释器路径执行安装命令，不要改用可能指向其他环境的 `python` 或 `py`。
 
 ## 0.4.1 修复
 
