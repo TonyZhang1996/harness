@@ -20,7 +20,7 @@ from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -715,7 +715,20 @@ class HarnessGUI:
             "active_process_body": "",
             "active_process_base_body": "",
             "active_process_item": None,
+            "rebuild_session_after_busy": False,
         }
+
+    @staticmethod
+    def _invalidate_sessions_for_connection_change(
+        runtimes: Iterable[dict[str, Any]],
+    ) -> None:
+        """Rebuild idle clients now and defer busy-client rebuilds safely."""
+        for runtime in runtimes:
+            if runtime.get("busy"):
+                runtime["rebuild_session_after_busy"] = True
+            else:
+                runtime["session"] = None
+                runtime["rebuild_session_after_busy"] = False
 
     def _runtime(self, session_id: str) -> dict[str, Any]:
         runtime = self.runtimes.get(session_id)
@@ -3100,6 +3113,14 @@ class HarnessGUI:
     ) -> None:
         """Start one model turn for a Session, including queued follow-ups."""
         runtime = self._runtime(session_id)
+        if runtime.get("rebuild_session_after_busy") and runtime.get("session") is not None:
+            # A connection change must not orphan a running worker. If the
+            # previous turn is paused and the user starts a new turn instead
+            # of resuming it, preserve its transcript before rebuilding the
+            # client with the new connection settings.
+            self._snapshot_agent_messages()
+            runtime["session"] = None
+            runtime["rebuild_session_after_busy"] = False
         runtime["busy"] = True
         runtime["paused"] = False
         runtime["stop_pending"] = False
@@ -3468,6 +3489,8 @@ class HarnessGUI:
         runtime["paused"] = False
         runtime["stop_pending"] = False
         runtime["worker"] = None
+        if runtime.pop("rebuild_session_after_busy", False):
+            runtime["session"] = None
         self._session_record(session_id)["updated_at"] = self._now()
         if next_task is not None:
             # Keep the Session busy across the hand-off so the composer does
@@ -4089,8 +4112,7 @@ class HarnessGUI:
         os.environ["AI_HARNESS_BASE_URL"] = api_url
         os.environ["AI_HARNESS_MODEL"] = model
         os.environ["AI_HARNESS_ENV_FILE"] = str(self.config_path)
-        for runtime in self.runtimes.values():
-            runtime["session"] = None
+        self._invalidate_sessions_for_connection_change(self.runtimes.values())
 
     def _on_close(self) -> None:
         self.closing = True

@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "pyinstaller>=6.0; platform_system == 'Windows'",
 ]
 
 [project.scripts]
