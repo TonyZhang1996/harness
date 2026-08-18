@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-08-18
+
+### Release
+
+- Cut a Windows single-file GUI release from the current workspace as `AI-Harness-0.6.0.exe`.
+- Keep API keys and local sessions outside the executable; connection settings and GUI state remain per-user under `%USERPROFILE%\\.ai-harness\\`.
+- Updated the package, GUI title, CLI version, and smoke-test version marker to 0.6.0.
+
 ## 0.5.0 — 2026-08-17
 
 ### Web search

@@ -14,6 +14,13 @@ OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
 OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4-flash"
 OPENCODE_GO_PROVIDER_ALIASES = frozenset({"go", "opencode-go", "opencode_go"})
 
+# OpenCode Go currently routes image requests through mimo-v2.5. The older
+# mimo-v2-omni ID may still appear in a model listing, but the provider now
+# rejects it as deprecated. Keep this separate from the Chat Completions list:
+# model names alone are not a capability contract, and mimo-v2.5-pro is
+# currently text-only.
+OPENCODE_GO_VISION_MODELS = frozenset({"mimo-v2.5"})
+
 # These Go models expose the OpenAI-compatible Chat Completions protocol and
 # therefore work with the current tool-calling client without another adapter.
 OPENCODE_GO_CHAT_MODELS = (

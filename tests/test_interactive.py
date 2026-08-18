@@ -106,6 +106,20 @@ def test_custom_gui_approver_survives_permission_switch(tmp_path):
     assert session.approver is approver
 
 
+def test_session_can_switch_model_without_discarding_history():
+    client = FakeClient()
+    session = AgentSession(client=client, model_name="deepseek-v4-flash")
+
+    assert session.ask("保留这段历史") == "收到"
+    session.set_model_name("glm-5.3")
+
+    assert session.model_name == "glm-5.3"
+    assert session.vision_router.text_model == "glm-5.3"
+    assert session.messages[1]["content"] == "保留这段历史"
+    assert session.ask("使用新模型继续") == "收到"
+    assert client.chat.completions.calls[-1]["model"] == "glm-5.3"
+
+
 def test_agent_turn_can_stop_and_resume():
     entered = threading.Event()
     release = threading.Event()
@@ -141,6 +155,109 @@ def test_agent_turn_can_stop_and_resume():
     assert len(errors) == 1
     assert isinstance(errors[0], AgentPaused)
     assert session.resume() == "继续完成"
+
+
+def test_agent_applies_live_direction_change_after_blocked_model_call():
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class SteerableCompletions:
+        def create(self, **kwargs):
+            calls.append({**kwargs, "messages": list(kwargs["messages"])})
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=2)
+                content = "原计划结果"
+            else:
+                content = "按新方向完成"
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=content, tool_calls=None)
+                    )
+                ]
+            )
+
+    events = []
+    session = AgentSession(
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SteerableCompletions())
+        ),
+        model_name="test-model",
+        event_callback=lambda kind, message: events.append((kind, message)),
+    )
+    result = []
+
+    worker = threading.Thread(
+        target=lambda: result.append(session.ask("先按原计划处理")),
+        daemon=True,
+    )
+    worker.start()
+    assert entered.wait(timeout=1)
+    assert session.request_direction_change("改为只检查测试，不要继续原计划") == 1
+    release.set()
+    worker.join(timeout=3)
+
+    assert result == ["按新方向完成"]
+    assert len(calls) == 2
+    steering_message = calls[1]["messages"][-1]
+    assert steering_message["role"] == "user"
+    assert "改为只检查测试" in steering_message["content"]
+    assert ("direction_applied", "改为只检查测试，不要继续原计划") in events
+
+
+def test_live_direction_change_skips_pending_tool_calls_without_breaking_history(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    tool_call = SimpleNamespace(
+        id="steer-call",
+        function=SimpleNamespace(
+            name="create_file",
+            arguments='{"path":"must-not-exist.txt","content":"old plan"}',
+        ),
+    )
+
+    class ToolSteerCompletions:
+        def create(self, **kwargs):
+            calls.append({**kwargs, "messages": list(kwargs["messages"])})
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=2)
+                message = SimpleNamespace(content=None, tool_calls=[tool_call])
+            else:
+                message = SimpleNamespace(content="已改按新方向完成", tool_calls=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    session = AgentSession(
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=ToolSteerCompletions())
+        ),
+        model_name="test-model",
+        workspace=tmp_path,
+    )
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(session.ask("先创建文件")),
+        daemon=True,
+    )
+    worker.start()
+    assert entered.wait(timeout=1)
+    session.steer("改为只说明方案，不要创建文件")
+    release.set()
+    worker.join(timeout=3)
+
+    assert result == ["已改按新方向完成"]
+    assert not (tmp_path / "must-not-exist.txt").exists()
+    second_messages = calls[1]["messages"]
+    assert any(
+        item.get("role") == "tool"
+        and item.get("tool_call_id") == "steer-call"
+        and "停止" in item.get("content", "")
+        for item in second_messages
+    )
+    assert "改为只说明方案" in second_messages[-1]["content"]
 
 
 def test_system_prompt_describes_windows_shell(monkeypatch):
@@ -212,7 +329,125 @@ def test_agent_executes_tool_and_reports_events(tmp_path):
 
     assert session.ask("创建文件") == "完成"
     assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "hello"
-    assert [kind for kind, _message in events] == ["tool_start", "tool_result"]
+    assert [kind for kind, _message in events] == [
+        "think",
+        "tool_start",
+        "tool_result",
+    ]
+
+
+def test_agent_uses_provider_visible_reasoning_for_think_event(tmp_path):
+    tool_call = SimpleNamespace(
+        id="call-reasoning",
+        function=SimpleNamespace(name="git_status", arguments="{}"),
+    )
+    responses = iter(
+        [
+            SimpleNamespace(
+                content=None,
+                reasoning_content="先检查工作区状态，再决定是否需要修改文件。",
+                tool_calls=[tool_call],
+            ),
+            SimpleNamespace(content="完成", tool_calls=None),
+        ]
+    )
+
+    class ToolCompletions:
+        def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=next(responses))]
+            )
+
+    events = []
+    session = AgentSession(
+        client=SimpleNamespace(chat=SimpleNamespace(completions=ToolCompletions())),
+        model_name="test-model",
+        workspace=tmp_path,
+        event_callback=lambda kind, message: events.append((kind, message)),
+    )
+
+    assert session.ask("检查状态") == "完成"
+    assert events[0] == ("think", "先检查工作区状态，再决定是否需要修改文件。")
+
+
+def test_agent_extracts_tagged_thinking_without_leaking_tags(tmp_path):
+    responses = iter(
+        [
+            SimpleNamespace(
+                content="<think>先整理目录信息</think>最终答案",
+                tool_calls=None,
+            )
+        ]
+    )
+
+    class Completions:
+        def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=next(responses))]
+            )
+
+    events = []
+    session = AgentSession(
+        client=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
+        model_name="test-model",
+        workspace=tmp_path,
+        event_callback=lambda kind, message: events.append((kind, message)),
+    )
+
+    assert session.ask("回答") == "最终答案"
+    assert events == [("think", "先整理目录信息")]
+
+
+def test_agent_stops_repeated_browser_search_failures(tmp_path):
+    responses = iter(
+        [
+            SimpleNamespace(
+                content=None,
+                tool_calls=[
+                    SimpleNamespace(
+                        id="browser-call-1",
+                        function=SimpleNamespace(
+                            name="browser_search",
+                            arguments='{"query":"测试"}',
+                        ),
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                content=None,
+                tool_calls=[
+                    SimpleNamespace(
+                        id="browser-call-2",
+                        function=SimpleNamespace(
+                            name="browser_search",
+                            arguments='{"query":"测试"}',
+                        ),
+                    )
+                ],
+            ),
+        ]
+    )
+    calls = 0
+
+    class RepeatingBrowserCompletions:
+        def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(choices=[SimpleNamespace(message=next(responses))])
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=RepeatingBrowserCompletions())
+    )
+    session = AgentSession(client=client, workspace=tmp_path)
+    session.tool_handlers["browser_search"] = lambda **_kwargs: (
+        "浏览器搜索不可用：运行 AI Harness 的 Python 环境未安装 Playwright。"
+    )
+
+    with pytest.raises(RuntimeError, match="连续失败两次"):
+        session.ask("搜索测试")
+
+    assert calls == 2
+    assert "系统已停止重复调用" in session.messages[-1]["content"]
 
 
 def test_agent_repairs_interrupted_tool_call_before_resume():
@@ -337,12 +572,22 @@ def test_gui_mousewheel_units_support_mac_and_x11(monkeypatch):
     assert gui_module._mousewheel_units(SimpleNamespace(delta=0, num=5)) == 1
 
 
-def test_gui_mousewheel_speed_is_reduced_without_losing_fractional_events():
+def test_gui_mousewheel_preserves_high_resolution_events_and_uses_pixel_distance(monkeypatch):
     import ai_harness.gui as gui_module
 
-    assert gui_module._scale_mousewheel_units(-1, 0.0) == (0, -0.2)
-    assert gui_module._scale_mousewheel_units(-1, -0.8) == (-1, 0.0)
-    assert gui_module._scale_mousewheel_units(1, -0.2) == (0, 0.0)
+    monkeypatch.setattr(gui_module.platform, "system", lambda: "Windows")
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=60, num=None)) == -0.5
+    assert gui_module._mousewheel_units(SimpleNamespace(delta=240, num=None)) == -2.0
+    assert gui_module._mousewheel_scroll_delta((0.2, 0.7), 800, -1) == pytest.approx(-0.03)
+    assert gui_module._mousewheel_scroll_delta((0.0, 1.0), 800, -1) == 0.0
+
+
+def test_gui_mousewheel_target_is_clamped_to_content_bounds():
+    from ai_harness.gui import HarnessGUI
+
+    assert HarnessGUI._clamp_mousewheel_target(-0.2, 0.25) == 0.0
+    assert HarnessGUI._clamp_mousewheel_target(0.5, 0.25) == pytest.approx(0.5)
+    assert HarnessGUI._clamp_mousewheel_target(0.9, 0.25) == pytest.approx(0.75)
 
 
 def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
@@ -452,6 +697,333 @@ def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
     finally:
         release_workers.set()
         root.destroy()
+
+
+def test_gui_queues_follow_up_until_current_session_turn_finishes(monkeypatch, tmp_path):
+    tkinter = pytest.importorskip("tkinter")
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+    except Exception as exc:  # headless CI without an X server
+        pytest.skip(f"无法初始化 Tk 界面：{exc}")
+
+    import ai_harness.gui as gui_module
+    from ai_harness.gui import HarnessGUI
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    calls = []
+    calls_lock = threading.Lock()
+
+    class QueueSession:
+        def __init__(self, **kwargs):
+            self.messages = [{"role": "system", "content": "sys"}]
+            self.stop_event = threading.Event()
+            self.model_name = kwargs.get("model_name") or "test-model"
+            self.event_callback = kwargs.get("event_callback")
+
+        def ask(self, task, attachments=None):
+            with calls_lock:
+                calls.append(task)
+                call_number = len(calls)
+            self.messages.append({"role": "user", "content": task})
+            if call_number == 1:
+                first_started.set()
+                if not release_first.wait(timeout=5):
+                    raise AssertionError("队列测试第一轮未被释放")
+                answer = "第一轮完成"
+            else:
+                second_started.set()
+                answer = f"回答:{task}"
+            self.messages.append({"role": "assistant", "content": answer})
+            return answer
+
+        def resume(self):
+            return "继续回答"
+
+        def request_stop(self):
+            self.stop_event.set()
+
+        def repair_tool_call_history(self):
+            return 0
+
+        def set_permission_mode(self, mode):
+            return mode
+
+        def generate_session_title(self, question, answer, max_chars=11):
+            return "队列测试"
+
+    monkeypatch.setattr(gui_module, "AgentSession", QueueSession)
+
+    try:
+        gui = HarnessGUI(
+            root,
+            workspace=str(tmp_path),
+            state_path=str(tmp_path / "gui-state.json"),
+            config_path=str(tmp_path / "conn.env"),
+        )
+        gui.prompt.insert("1.0", "第一轮任务")
+        gui.send_message()
+        session_id = gui.current_session_id
+        assert first_started.wait(timeout=2)
+
+        gui.prompt.insert("1.0", "第一轮完成后继续检查")
+        gui.queue_message()
+        assert len(gui._runtime(session_id)["follow_up_queue"]) == 1
+
+        release_first.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not second_started.is_set():
+            gui._drain_events()
+            root.update_idletasks()
+            time.sleep(0.02)
+        assert second_started.is_set()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and gui._runtime(session_id)["busy"]:
+            gui._drain_events()
+            root.update_idletasks()
+            time.sleep(0.02)
+        gui._drain_events()
+
+        assert calls == ["第一轮任务", "第一轮完成后继续检查"]
+        assert not gui._runtime(session_id)["follow_up_queue"]
+        assert any(
+            item["body"] == "回答:第一轮完成后继续检查"
+            for item in gui._session_record(session_id)["items"]
+        )
+    finally:
+        release_first.set()
+        root.destroy()
+
+
+def test_gui_can_send_new_message_after_stopping_session(monkeypatch, tmp_path):
+    tkinter = pytest.importorskip("tkinter")
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+    except Exception as exc:  # headless CI without an X server
+        pytest.skip(f"无法初始化 Tk 界面：{exc}")
+
+    import ai_harness.gui as gui_module
+    from ai_harness.gui import HarnessGUI
+
+    first_started = threading.Event()
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    class StoppableSession:
+        def __init__(self, **kwargs):
+            self.messages = [{"role": "system", "content": "sys"}]
+            self.stop_event = threading.Event()
+            self.model_name = kwargs.get("model_name") or "test-model"
+            self.event_callback = kwargs.get("event_callback")
+
+        def ask(self, task, attachments=None):
+            with calls_lock:
+                calls.append(task)
+            self.messages.append({"role": "user", "content": task})
+            if task == "第一轮任务":
+                first_started.set()
+                while not self.stop_event.wait(0.01):
+                    pass
+                raise AgentPaused("运行已由用户停止")
+            answer = f"回答:{task}"
+            self.messages.append({"role": "assistant", "content": answer})
+            return answer
+
+        def resume(self):
+            return "继续回答"
+
+        def request_stop(self):
+            self.stop_event.set()
+
+        def repair_tool_call_history(self):
+            return 0
+
+        def set_permission_mode(self, mode):
+            return mode
+
+        def generate_session_title(self, question, answer, max_chars=11):
+            return "停止后继续"
+
+    monkeypatch.setattr(gui_module, "AgentSession", StoppableSession)
+
+    try:
+        gui = HarnessGUI(
+            root,
+            workspace=str(tmp_path),
+            state_path=str(tmp_path / "gui-state.json"),
+            config_path=str(tmp_path / "conn.env"),
+        )
+        gui.prompt.insert("1.0", "第一轮任务")
+        gui.send_message()
+        session_id = gui.current_session_id
+        assert first_started.wait(timeout=2)
+
+        gui.stop_running()
+        # The stop request is cooperative: the text area becomes editable
+        # immediately, while the send action waits for the paused event.
+        assert gui.prompt.cget("state") == "normal"
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            gui._drain_events()
+            root.update_idletasks()
+            runtime = gui._runtime(session_id)
+            if runtime["paused"] and not runtime["stop_pending"]:
+                break
+            time.sleep(0.02)
+        gui._drain_events()
+
+        runtime = gui._runtime(session_id)
+        assert runtime["paused"] is True
+        assert runtime["stop_pending"] is False
+        assert gui.prompt.cget("state") == "normal"
+        assert gui.send_button.cget("text") == "发送"
+
+        gui.prompt.insert("1.0", "第二轮任务")
+        gui.send_message()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            gui._drain_events()
+            root.update_idletasks()
+            if calls == ["第一轮任务", "第二轮任务"] and not gui._runtime(session_id)["busy"]:
+                break
+            time.sleep(0.02)
+        gui._drain_events()
+
+        assert calls == ["第一轮任务", "第二轮任务"]
+        assert not gui._runtime(session_id)["busy"]
+        assert any(
+            item["body"] == "回答:第二轮任务"
+            for item in gui._session_record(session_id)["items"]
+        )
+    finally:
+        root.destroy()
+
+
+def test_gui_user_card_renders_and_restores_image_attachment(tmp_path):
+    tkinter = pytest.importorskip("tkinter")
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+    except Exception as exc:  # headless CI without an X server
+        pytest.skip(f"无法初始化 Tk 界面：{exc}")
+
+    from PIL import Image
+    from ai_harness.gui import HarnessGUI
+
+    image_path = tmp_path / "chat-image.png"
+    Image.new("RGB", (320, 180), color="#6b9ee6").save(image_path)
+
+    try:
+        gui = HarnessGUI(
+            root,
+            workspace=str(tmp_path),
+            state_path=str(tmp_path / "gui-state.json"),
+            config_path=str(tmp_path / "conn.env"),
+        )
+        card = gui._add_card(
+            "user",
+            "你",
+            "请描述这张图片",
+            attachments=[image_path],
+        )
+        root.update_idletasks()
+
+        assert card is not None
+        assert card["image_count"] == 1
+        assert len(gui._chat_image_references) == 1
+        assert gui._current_record()["items"][-1]["attachments"] == [
+            str(image_path.resolve())
+        ]
+
+        gui._render_current_session()
+        root.update_idletasks()
+        assert len(gui._chat_image_references) == 1
+
+        legacy_path = gui.attachments_dir / "clipboard-legacy.png"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (320, 180), color="#e66b6b").save(legacy_path)
+        gui._current_record()["items"] = [
+            {
+                "role": "user",
+                "title": "你",
+                "body": f"旧消息\n\n附件：{legacy_path.name}",
+            }
+        ]
+        gui._render_current_session()
+        root.update_idletasks()
+        assert len(gui._chat_image_references) == 1
+    finally:
+        root.destroy()
+
+
+def test_gui_composer_context_controls_switch_workspace_model_and_permission(
+    monkeypatch, tmp_path
+):
+    tkinter = pytest.importorskip("tkinter")
+    from tkinter import ttk
+
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+    except Exception as exc:  # headless CI without an X server
+        pytest.skip(f"无法初始化 Tk 界面：{exc}")
+
+    import ai_harness.gui as gui_module
+    from ai_harness.gui import HarnessGUI
+
+    other_workspace = tmp_path / "other-project"
+    other_workspace.mkdir()
+    try:
+        gui = HarnessGUI(
+            root,
+            workspace=str(tmp_path),
+            state_path=str(tmp_path / "gui-state.json"),
+            config_path=str(tmp_path / "conn.env"),
+        )
+        assert isinstance(gui.composer_project, ttk.Button)
+        assert isinstance(gui.composer_model, ttk.Combobox)
+        assert isinstance(gui.composer_permission, ttk.Combobox)
+
+        monkeypatch.setattr(
+            gui_module.filedialog,
+            "askdirectory",
+            lambda **_kwargs: str(other_workspace),
+        )
+        gui.composer_project.invoke()
+        assert gui.workspace == other_workspace.resolve()
+
+        gui.composer_model.set("glm-5.3")
+        gui.change_model(object())
+        assert gui.model_name == "glm-5.3"
+        assert gui.composer_model.get() == "glm-5.3"
+
+        gui.composer_permission.set("请求批准")
+        gui.change_permission(object())
+        assert gui.permission_mode == "ask"
+    finally:
+        root.destroy()
+
+
+def test_gui_extracts_remote_search_image_markdown():
+    from ai_harness.gui import _extract_remote_image_refs, _remove_remote_image_markdown
+
+    body = (
+        "刘德华搜索结果\n"
+        "![刘德华头像](https://cdn.example.test/avatar.jpg)\n"
+        "![壁纸](<https://cdn.example.test/wallpaper.webp>)"
+    )
+
+    assert _extract_remote_image_refs(body) == [
+        ("刘德华头像", "https://cdn.example.test/avatar.jpg"),
+        ("壁纸", "https://cdn.example.test/wallpaper.webp"),
+    ]
+    assert _remove_remote_image_markdown(body) == "刘德华搜索结果\n刘德华头像\n壁纸"
 
 
 def test_full_access_forces_automatic_command_approval(tmp_path):
