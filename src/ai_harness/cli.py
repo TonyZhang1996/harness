@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -259,7 +260,23 @@ def run_interactive(
             print(f"\n执行失败：{exc}")
 
 
+def _is_bare_gui_alias() -> bool:
+    """Make the installed ``harness`` command open the GUI when used bare.
+
+    Keep ``python -m ai_harness`` and ``ai-harness`` as CLI entry points, and
+    preserve CLI behavior when the user passes a task or any option.
+    """
+
+    return Path(sys.argv[0]).stem.lower() == "harness" and len(sys.argv) == 1
+
+
 def main() -> None:
+    if _is_bare_gui_alias():
+        from .gui import launch_gui
+
+        launch_gui(workspace=str(Path.cwd()), approval_mode="auto")
+        return
+
     args = build_parser().parse_args()
     try:
         if args.env_file:

@@ -81,6 +81,10 @@ _BLOCK_RULES: tuple[tuple[str, str], ...] = (
 _MANUAL_RULES: tuple[tuple[str, str], ...] = (
     (r"(?i)^访问摄像头", "摄像头属于隐私设备"),
     (
+        r"(?i)\bnpx(?:\.cmd)?\b(?![^|;&\r\n]*--no-install\b)",
+        "可能下载或执行未安装的 npm 包",
+    ),
+    (
         r"(?i)(\b(?:remove-item|del(?:ete)?|erase|rm|rmdir|truncate)\b|\bgit\s+(?:clean|reset\s+--hard)\b|\bformat-volume\b|(?:^|[|;&]\s*)format\s+[a-z]:)",
         "包含删除、覆盖或不可逆修改",
     ),
@@ -122,6 +126,8 @@ Decision rules:
   cookies, private data, or sensitive local files. Network access alone is not a reason to ask.
 - ask: user intent is missing, scope is ambiguous, the action touches privacy devices or system
   state, installs software, deletes or overwrites material data, or safety cannot be established.
+- Treat `npx` as potentially downloading or executing an unreviewed npm package; ask unless the
+  command explicitly uses `--no-install`.
 - Never infer that running in a workspace makes an arbitrary shell command sandboxed.
 """
 

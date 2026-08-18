@@ -62,6 +62,15 @@ def test_local_policy_does_not_block_normal_code_search_or_format_list():
     assert AutoReviewApprover._local_policy("Get-StartApps | Format-List") is None
 
 
+def test_local_policy_requires_confirmation_for_implicit_npx_install():
+    result = AutoReviewApprover._local_policy("npx asar --version")
+
+    assert result is not None
+    assert result.decision == "ask"
+    assert "npm" in result.reason
+    assert AutoReviewApprover._local_policy("npx --no-install asar --version") is None
+
+
 def test_auto_review_allows_ordinary_network_without_prompt_or_model(tmp_path):
     requested = []
     client = FakeReviewerClient("{}")

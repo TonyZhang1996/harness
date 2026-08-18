@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlencode, urlsplit
+
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+except ImportError:  # pragma: no cover - actionable runtime error below
+    _sync_playwright = None  # type: ignore[assignment]
 
 
 WORKSPACE_ROOT = Path.cwd().resolve()
@@ -40,7 +50,265 @@ SENSITIVE_ENV_KEYS = {
     "DEEPSEEK_API_KEY",
     "OPENAI_API_KEY",
 }
+BROWSER_PROXY_ENV_NAMES = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+SUPPORTED_BROWSER_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+IMAGE_QUERY_MARKERS = (
+    "图片",
+    "照片",
+    "头像",
+    "壁纸",
+    "写真",
+    "图集",
+    "图像",
+    "image",
+    "photo",
+    "wallpaper",
+    "portrait",
+    "headshot",
+)
+MAX_BROWSER_IMAGE_RESULTS = 8
 ApprovalCallback = Callable[[str, Path], bool]
+CommandProgressCallback = Callable[[str], None]
+
+
+def _load_sync_playwright() -> Callable[..., Any] | None:
+    """Load Playwright lazily so a running agent can recover after installation."""
+    global _sync_playwright
+    if _sync_playwright is not None:
+        return _sync_playwright
+    try:
+        importlib.invalidate_caches()
+        module = importlib.import_module("playwright.sync_api")
+        candidate = getattr(module, "sync_playwright", None)
+    except (ImportError, AttributeError):
+        return None
+    if not callable(candidate):
+        return None
+    _sync_playwright = candidate
+    return candidate
+
+
+def _playwright_command(module: str, *arguments: str) -> str:
+    """Render a copyable command using the interpreter running AI Harness."""
+    return subprocess.list2cmdline([sys.executable, "-m", module, *arguments])
+
+
+def _browser_proxy_from_environment() -> dict[str, str] | None:
+    """Translate the first usable standard proxy variable for Playwright.
+
+    Playwright does not reliably inherit the proxy used by command-line tools
+    on every platform, so pass it explicitly to Chromium. Credentials stay in
+    the launch options and are never included in tool output.
+    """
+    for environment_name in BROWSER_PROXY_ENV_NAMES:
+        raw_value = os.getenv(environment_name, "").strip()
+        if not raw_value:
+            continue
+        candidate = raw_value if "://" in raw_value else f"http://{raw_value}"
+        try:
+            parsed = urlsplit(candidate)
+            scheme = parsed.scheme.casefold()
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            continue
+        if scheme not in SUPPORTED_BROWSER_PROXY_SCHEMES or not hostname:
+            continue
+
+        # Playwright understands socks5, while socks5h is a curl/urllib
+        # convention for resolving DNS through the SOCKS proxy.
+        if scheme == "socks5h":
+            scheme = "socks5"
+        host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        server = f"{scheme}://{host}"
+        if port is not None:
+            server += f":{port}"
+        proxy: dict[str, str] = {"server": server}
+        if parsed.username is not None:
+            proxy["username"] = unquote(parsed.username)
+        if parsed.password is not None:
+            proxy["password"] = unquote(parsed.password)
+        return proxy
+    return None
+
+
+def _browser_search_url(query: str, engine: str) -> str:
+    if engine == "baidu":
+        return "https://www.baidu.com/s?" + urlencode({"wd": query})
+    return "https://www.bing.com/search?" + urlencode({"q": query})
+
+
+def _browser_image_search_url(query: str, engine: str) -> str:
+    if engine == "baidu":
+        return "https://image.baidu.com/search/index?" + urlencode(
+            {"tn": "baiduimage", "word": query}
+        )
+    return "https://www.bing.com/images/search?" + urlencode({"q": query})
+
+
+def _looks_like_image_query(query: str) -> bool:
+    normalized = query.casefold()
+    return any(marker in normalized for marker in IMAGE_QUERY_MARKERS)
+
+
+def _normalize_browser_image_url(raw_url: Any) -> str | None:
+    if not isinstance(raw_url, str):
+        return None
+    value = raw_url.strip()
+    if value.startswith("//"):
+        value = "https:" + value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    return value
+
+
+def _extract_browser_image_urls(page: Any) -> list[str]:
+    """Extract public image URLs from an image-search page, not search links."""
+    try:
+        candidates = page.evaluate(
+            """
+            () => Array.from(document.images).map((image) => ({
+                currentSrc: image.currentSrc || '',
+                src: image.src || '',
+                dataSrc: image.getAttribute('data-src') || '',
+                dataImgUrl: image.getAttribute('data-imgurl') || '',
+                dataOriginal: image.getAttribute('data-original') || '',
+                dataOriginalSrc: image.getAttribute('data-original-src') || ''
+            }))
+            """
+        )
+    except Exception:
+        return []
+
+    urls: list[str] = []
+    if not isinstance(candidates, list):
+        return urls
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in (
+            "dataImgUrl",
+            "dataOriginal",
+            "dataOriginalSrc",
+            "dataSrc",
+            "currentSrc",
+            "src",
+        ):
+            url = _normalize_browser_image_url(candidate.get(key))
+            if url is None or url in urls:
+                continue
+            parsed = urlsplit(url)
+            if (
+                parsed.hostname == "www.baidu.com"
+                and "/img/flexible/logo/" in parsed.path
+            ):
+                continue
+            urls.append(url)
+            break
+        if len(urls) >= MAX_BROWSER_IMAGE_RESULTS:
+            break
+    return urls
+
+
+def _browser_search_once(
+    sync_playwright: Callable[..., Any],
+    query: str,
+    engine: str,
+    max_chars: int,
+    timeout: int,
+    proxy: dict[str, str] | None,
+    image_search: bool,
+) -> str:
+    """Run one isolated browser search attempt."""
+    search_url = (
+        _browser_image_search_url(query, engine)
+        if image_search
+        else _browser_search_url(query, engine)
+    )
+    with sync_playwright() as playwright:
+        launch_options: dict[str, Any] = {"headless": True}
+        if proxy is not None:
+            launch_options["proxy"] = proxy
+        browser = playwright.chromium.launch(**launch_options)
+        try:
+            context_options: dict[str, Any] = {
+                "user_agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/148.0 Safari/537.36"
+                ),
+                "locale": "zh-CN",
+            }
+            # The local desktop proxy used by this machine intercepts public
+            # HTTPS. A fresh public-search context has no cookies or private
+            # pages, so allow that proxy certificate only when a proxy is in
+            # use; direct browsing keeps normal TLS verification.
+            if proxy is not None:
+                context_options["ignore_https_errors"] = True
+            context = browser.new_context(**context_options)
+            page = context.new_page()
+            page.goto(
+                search_url,
+                wait_until="domcontentloaded",
+                timeout=timeout * 1000,
+            )
+            page.wait_for_timeout(1_000)
+            title = page.title()
+            final_url = page.url
+            body = page.inner_text("body")
+            if len(body) > max_chars:
+                body = body[:max_chars] + "\n[浏览器搜索结果已截断]"
+            image_urls = _extract_browser_image_urls(page) if image_search else []
+            if image_urls:
+                body += "\n\n图片预览（点击图片可打开原图）：\n"
+                body += "\n".join(
+                    f"![{query.strip()[:80]}]({url})" for url in image_urls
+                )
+            return (
+                f"搜索引擎: {engine}\n"
+                f"查询: {query.strip()}\n"
+                f"页面标题: {title}\n"
+                f"最终 URL: {final_url}\n"
+                "----\n"
+                f"{body}"
+            )
+        finally:
+            browser.close()
+
+
+def _is_missing_playwright_browser(detail: str) -> bool:
+    normalized = detail.casefold()
+    return "executable doesn't exist" in normalized or "playwright install" in normalized
+
+
+def _is_network_browser_failure(detail: str) -> bool:
+    normalized = detail.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "timeout",
+            "timed out",
+            "net::",
+            "err_",
+            "connection",
+            "ssl",
+            "502 bad gateway",
+            "503 service",
+            "504 gateway",
+            "network",
+        )
+    )
 
 
 def _get_filesystem_roots() -> tuple[Path, ...]:
@@ -259,6 +527,105 @@ def search_text(
     return "\n".join(matches) or "[未找到匹配内容]"
 
 
+def browser_search(
+    query: str,
+    engine: str = "baidu",
+    max_chars: int = 12_000,
+    timeout: int = 45,
+    workspace_root: str | Path | None = None,
+    allowed_roots: Iterable[str | Path] | None = None,
+    approval_callback: ApprovalCallback | None = None,
+    image_search: bool | None = None,
+) -> str:
+    """Search public web results through a fresh headless Chromium context.
+
+    The tool intentionally accepts a query rather than an arbitrary URL. This
+    keeps browser access useful for current-information questions without
+    allowing the model to navigate to local files, private pages, or arbitrary
+    endpoints.
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("搜索关键词不能为空")
+    if engine not in {"baidu", "bing"}:
+        raise ValueError("engine 只能是 baidu 或 bing")
+    if max_chars < 1:
+        raise ValueError("max_chars 必须大于 0")
+    if timeout < 5 or timeout > 120:
+        raise ValueError("timeout 必须在 5 到 120 秒之间")
+
+    if image_search is None:
+        image_search = _looks_like_image_query(query)
+    root = _get_workspace_root(workspace_root)
+    search_kind = "图片搜索" if image_search else "网页搜索"
+    approval_text = (
+        f"使用无头浏览器访问公开搜索引擎 {engine}进行{search_kind}，"
+        f"搜索：{query.strip()[:500]}"
+    )
+    if approval_callback is None or not approval_callback(approval_text, root):
+        return "浏览器搜索被用户或审批策略拒绝"
+
+    sync_playwright = _load_sync_playwright()
+    if sync_playwright is None:
+        install_package = _playwright_command("pip", "install", "playwright")
+        install_browser = _playwright_command("playwright", "install", "chromium")
+        return (
+            "浏览器搜索不可用：运行 AI Harness 的 Python 环境未安装 Playwright。"
+            f"当前解释器：{sys.executable}。请在这个环境执行"
+            f" `{install_package}`，再执行 `{install_browser}`；"
+            "不要改用其他 Python 环境。"
+        )
+
+    proxy = _browser_proxy_from_environment()
+    engines = [engine]
+    if engine == "bing":
+        # The local proxy currently serves Baidu but does not complete Bing's
+        # navigation. Keep the requested engine first, then make the public
+        # search tool useful instead of returning a failure that the agent
+        # will repeat until its retry guard stops the task.
+        engines.append("baidu")
+
+    failures: list[str] = []
+    for candidate_engine in engines:
+        try:
+            result = _browser_search_once(
+                sync_playwright,
+                query,
+                candidate_engine,
+                max_chars,
+                timeout,
+                proxy,
+                image_search,
+            )
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            if _is_missing_playwright_browser(detail):
+                install_browser = _playwright_command("playwright", "install", "chromium")
+                detail = (
+                    "Playwright 浏览器内核未安装。请在运行 AI Harness 的同一个"
+                    f" Python 环境执行 `{install_browser}`。"
+                )
+                return f"浏览器搜索失败：{detail[:2000]}"
+
+            failures.append(f"{candidate_engine}: {detail[:1200]}")
+            can_fallback = (
+                candidate_engine == engine
+                and engine == "bing"
+                and _is_network_browser_failure(detail)
+            )
+            if can_fallback:
+                continue
+            break
+
+        if candidate_engine != engine:
+            result += f"\n\n说明：{engine} 访问失败，已自动回退到 {candidate_engine}。"
+        return result
+
+    detail = "\n".join(failures) or "未返回具体错误"
+    if proxy is not None:
+        detail += f"\n当前浏览器代理: {proxy['server']}"
+    return f"浏览器搜索失败：{detail[:3000]}"
+
+
 def write_file(
     path: str,
     content: str,
@@ -462,6 +829,7 @@ def run_command(
     allowed_roots: Iterable[str | Path] | None = None,
     approval_callback: ApprovalCallback | None = None,
     cancel_event: threading.Event | None = None,
+    progress_callback: CommandProgressCallback | None = None,
 ) -> str:
     """Run a shell command after approval, without forwarding model API keys."""
     if not command.strip():
@@ -489,33 +857,121 @@ def run_command(
         cwd=command_cwd,
         env=_clean_subprocess_env(),
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
         text=True,
+        bufsize=1,
         **_hidden_subprocess_kwargs(),
     )
     deadline = time.monotonic() + timeout
     stopped = False
     timed_out = False
-    while True:
-        try:
-            stdout, stderr = process.communicate(timeout=0.15)
-            break
-        except subprocess.TimeoutExpired:
+    output_parts: list[str] = []
+
+    # Keep compatibility with lightweight Popen fakes used by callers/tests that
+    # do not expose a stdout pipe. Real processes use the streaming path below.
+    if getattr(process, "stdout", None) is None:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.15)
+                output_parts.append(stdout + stderr)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_event is not None and cancel_event.is_set():
+                    stopped = True
+                elif time.monotonic() >= deadline:
+                    timed_out = True
+                else:
+                    continue
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                output_parts.append(stdout + stderr)
+                break
+    else:
+        output_queue: queue.Queue[str | None] = queue.Queue()
+
+        def read_output() -> None:
+            try:
+                for chunk in iter(process.stdout.readline, ""):
+                    output_queue.put(chunk)
+            finally:
+                output_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        stream_closed = False
+        started_at = time.monotonic()
+        next_progress_at = started_at + 1.0
+
+        def emit_progress(now: float) -> None:
+            if progress_callback is None:
+                return
+            elapsed = max(1, int(now - started_at))
+            output = "".join(output_parts).strip()
+            if output:
+                recent = output[-1200:]
+                message = f"运行中 · 已用时 {elapsed}s\n{recent}"
+            else:
+                message = f"运行中 · 已用时 {elapsed}s · 命令暂时没有输出"
+            try:
+                progress_callback(message)
+            except Exception:
+                # A UI/event listener must never interrupt the command itself.
+                pass
+
+        while True:
+            try:
+                chunk = output_queue.get(timeout=0.15)
+                if chunk is None:
+                    stream_closed = True
+                else:
+                    output_parts.append(chunk)
+            except queue.Empty:
+                pass
+
+            now = time.monotonic()
+            if progress_callback is not None and now >= next_progress_at:
+                emit_progress(now)
+                next_progress_at = now + 1.5
+
+            if process.poll() is not None and stream_closed:
+                break
             if cancel_event is not None and cancel_event.is_set():
                 stopped = True
-            elif time.monotonic() >= deadline:
+            elif now >= deadline:
                 timed_out = True
-            else:
-                continue
-            process.terminate()
-            try:
-                stdout, stderr = process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-            break
+            if stopped or timed_out:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                # Closing the parent's read end also unblocks a shell whose
+                # child inherited stdout while the command is being stopped.
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+                break
 
-    output = stdout + stderr
+        # Drain data already delivered by the reader before rendering the final
+        # result. Do not wait indefinitely for descendants that kept a pipe open.
+        drain_deadline = time.monotonic() + 0.5
+        while time.monotonic() < drain_deadline:
+            try:
+                chunk = output_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+            output_parts.append(chunk)
+
+    output = "".join(output_parts)
     if stopped:
         return f"命令执行已由用户停止\n{output[:max_chars]}".rstrip()
     if timed_out:

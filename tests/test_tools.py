@@ -11,6 +11,7 @@ import pytest
 import ai_harness.tools as tools_module
 from ai_harness.agent import _execute_tool, _handlers_for_workspace
 from ai_harness.tools import (
+    browser_search,
     capture_photo,
     create_directory,
     create_file,
@@ -34,6 +35,200 @@ def test_file_lifecycle(tmp_path: Path):
 
     assert delete_file("nested/example.txt", tmp_path) == "已删除文件: nested/example.txt"
     assert not (tmp_path / "nested/example.txt").exists()
+
+
+def test_browser_search_uses_headless_chromium_and_public_search_url(
+    tmp_path: Path, monkeypatch
+):
+    calls = []
+
+    for environment_name in tools_module.BROWSER_PROXY_ENV_NAMES:
+        monkeypatch.delenv(environment_name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:6268")
+
+    class FakePage:
+        url = "https://www.baidu.com/s?wd=%E6%B5%8B%E8%AF%95"
+
+        def goto(self, url, **kwargs):
+            calls.append(("goto", url, kwargs))
+
+        def wait_for_timeout(self, milliseconds):
+            calls.append(("wait", milliseconds))
+
+        def title(self):
+            return "测试_百度搜索"
+
+        def inner_text(self, selector):
+            assert selector == "body"
+            return "搜索结果正文"
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):
+            calls.append(("context", kwargs))
+            return FakeContext()
+
+        def close(self):
+            calls.append(("close",))
+
+    class FakeChromium:
+        def launch(self, **kwargs):
+            calls.append(("launch", kwargs))
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class PlaywrightContext:
+        def __enter__(self):
+            return FakePlaywright()
+
+        def __exit__(self, *_args):
+            return False
+
+    approvals = []
+    monkeypatch.setattr(tools_module, "_sync_playwright", lambda: PlaywrightContext())
+    result = browser_search(
+        "测试关键词",
+        workspace_root=tmp_path,
+        approval_callback=lambda action, cwd: approvals.append((action, cwd)) or True,
+    )
+
+    assert "搜索结果正文" in result
+    assert approvals[0][1] == tmp_path.resolve()
+    assert calls[0] == (
+        "launch",
+        {"headless": True, "proxy": {"server": "http://127.0.0.1:6268"}},
+    )
+    assert calls[1][0] == "context"
+    assert calls[1][1]["ignore_https_errors"] is True
+    assert "wd=%E6%B5%8B%E8%AF%95%E5%85%B3%E9%94%AE%E8%AF%8D" in calls[2][1]
+    assert calls[-1] == ("close",)
+
+
+def test_browser_search_falls_back_to_baidu_after_bing_network_failure(
+    tmp_path: Path, monkeypatch
+):
+    for environment_name in tools_module.BROWSER_PROXY_ENV_NAMES:
+        monkeypatch.delenv(environment_name, raising=False)
+
+    attempts = []
+
+    def fake_search_once(
+        sync_playwright, query, engine, max_chars, timeout, proxy, image_search
+    ):
+        attempts.append((engine, timeout, proxy, image_search))
+        if engine == "bing":
+            raise RuntimeError("Page.goto: Timeout 5000ms exceeded")
+        return "搜索引擎: baidu\n查询: 测试关键词\n----\n搜索结果正文"
+
+    monkeypatch.setattr(tools_module, "_sync_playwright", lambda: object())
+    monkeypatch.setattr(tools_module, "_browser_search_once", fake_search_once)
+
+    result = browser_search(
+        "测试关键词",
+        engine="bing",
+        timeout=10,
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: True,
+    )
+
+    assert "搜索引擎: baidu" in result
+    assert "已自动回退到 baidu" in result
+    assert [attempt[0] for attempt in attempts] == ["bing", "baidu"]
+    assert all(attempt[2] is None for attempt in attempts)
+    assert all(attempt[3] is False for attempt in attempts)
+
+
+def test_browser_image_search_extracts_public_image_urls_only():
+    class FakePage:
+        def evaluate(self, _script):
+            return [
+                {"dataImgUrl": "https://cdn.example.test/portrait.jpg"},
+                {"src": "data:image/png;base64,not-a-remote-image"},
+                {"dataSrc": "//cdn.example.test/wallpaper.webp"},
+                {"src": "javascript:alert(1)"},
+                {"dataOriginal": "https://cdn.example.test/portrait.jpg"},
+            ]
+
+    assert tools_module._extract_browser_image_urls(FakePage()) == [
+        "https://cdn.example.test/portrait.jpg",
+        "https://cdn.example.test/wallpaper.webp",
+    ]
+
+
+def test_browser_search_auto_detects_image_queries(tmp_path: Path, monkeypatch):
+    for environment_name in tools_module.BROWSER_PROXY_ENV_NAMES:
+        monkeypatch.delenv(environment_name, raising=False)
+    calls = []
+
+    def fake_search_once(
+        sync_playwright, query, engine, max_chars, timeout, proxy, image_search
+    ):
+        calls.append(image_search)
+        return "搜索引擎: baidu\n图片预览"
+
+    monkeypatch.setattr(tools_module, "_sync_playwright", lambda: object())
+    monkeypatch.setattr(tools_module, "_browser_search_once", fake_search_once)
+
+    result = browser_search(
+        "刘德华照片",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: True,
+    )
+
+    assert "图片预览" in result
+    assert calls == [True]
+
+
+def test_browser_search_requires_approval(tmp_path: Path):
+    result = browser_search(
+        "不应执行",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: False,
+    )
+
+    assert result == "浏览器搜索被用户或审批策略拒绝"
+
+
+def test_playwright_is_loaded_lazily_after_runtime_install(monkeypatch):
+    fake_sync_playwright = lambda: None
+
+    monkeypatch.setattr(tools_module, "_sync_playwright", None)
+    monkeypatch.setattr(tools_module.importlib, "invalidate_caches", lambda: None)
+    monkeypatch.setattr(
+        tools_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(sync_playwright=fake_sync_playwright),
+    )
+
+    assert tools_module._load_sync_playwright() is fake_sync_playwright
+    assert tools_module._sync_playwright is fake_sync_playwright
+
+
+def test_browser_search_reports_the_running_interpreter_when_playwright_is_missing(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(tools_module, "_sync_playwright", None)
+    monkeypatch.setattr(
+        tools_module.importlib,
+        "import_module",
+        lambda _name: (_ for _ in ()).throw(ImportError("not installed")),
+    )
+
+    result = browser_search(
+        "缺少依赖",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: True,
+    )
+
+    assert sys.executable in result
+    assert tools_module._playwright_command("pip", "install", "playwright") in result
+    assert tools_module._playwright_command("playwright", "install", "chromium") in result
+    assert "不要改用其他 Python 环境" in result
 
 
 def test_create_file_does_not_overwrite(tmp_path: Path):
@@ -156,6 +351,22 @@ def test_run_command_does_not_forward_api_keys(tmp_path: Path, monkeypatch):
     )
     assert "must-not-leak" not in result
     assert "退出码: 1" in result
+
+
+def test_run_command_reports_progress_while_silent(tmp_path: Path):
+    progress: list[str] = []
+    command = _python_command("import time; time.sleep(1.3)")
+
+    result = run_command(
+        command,
+        workspace_root=tmp_path,
+        timeout=5,
+        approval_callback=lambda _command, _cwd: True,
+        progress_callback=progress.append,
+    )
+
+    assert "退出码: 0" in result
+    assert any("运行中" in message and "没有输出" in message for message in progress)
 
 
 def test_mutation_through_symlink_is_rejected(tmp_path: Path):
@@ -333,6 +544,7 @@ def test_run_command_uses_powershell_on_windows(tmp_path: Path, monkeypatch):
     assert recorded[0][0].endswith("pwsh.exe")
     assert "-NoProfile" in recorded[0]
     assert recorded_kwargs[0]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert recorded_kwargs[0]["stdin"] is subprocess.DEVNULL
     if hasattr(subprocess, "STARTUPINFO"):
         assert recorded_kwargs[0]["startupinfo"].wShowWindow == subprocess.SW_HIDE
     else:
