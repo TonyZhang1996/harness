@@ -9,13 +9,14 @@ from ai_harness.gui import (
     _model_catalog_url,
     _parse_model_catalog,
     _compact_process_preview,
+    _PillBubble,
     launch_gui,
 )
 import inspect
 
 
 def test_package_has_version():
-    assert __version__ == "0.6.0"
+    assert __version__ == "0.6.1"
 
 
 def test_parser_accepts_task():
@@ -46,6 +47,41 @@ def test_gui_defaults_to_auto_review():
 
     assert gui_default == "auto"
     assert launch_default == "auto"
+
+
+def test_pill_bubble_moves_canvas_window_with_coords_not_item_options():
+    bubble = _PillBubble.__new__(_PillBubble)
+    bubble._radius = 24
+    bubble._content_window = 7
+    calls = []
+    bubble.coords = lambda *args: calls.append(("coords", *args))
+    bubble.itemconfigure = lambda *args, **kwargs: calls.append(
+        ("itemconfigure", *args, kwargs)
+    )
+
+    bubble._position_content(100, 40)
+
+    assert calls == [
+        ("coords", 7, 24, 0),
+        ("itemconfigure", 7, {"width": 52, "height": 40}),
+    ]
+
+
+def test_selectable_body_line_count_uses_tkinter_count_option_names():
+    from ai_harness.gui import HarnessGUI
+
+    class FakeText:
+        def __init__(self):
+            self.args = None
+
+        def count(self, *args):
+            self.args = args
+            return 6
+
+    widget = FakeText()
+
+    assert HarnessGUI._selectable_body_line_count(widget) == 6
+    assert widget.args == ("1.0", "end-1c", "update", "displaylines")
 
 
 def test_approval_dialog_is_promoted_to_foreground_on_windows(monkeypatch):

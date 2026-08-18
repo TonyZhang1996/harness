@@ -73,13 +73,11 @@ PERMISSION_LABELS = {
 
 UI_FONT = "Microsoft YaHei UI" if platform.system() == "Windows" else "TkDefaultFont"
 MAX_RENDERED_HISTORY_ITEMS = 80
-# A Windows wheel notch is normally reported as delta=120. Move by roughly
-# three text lines per notch, then ease to the target position so the Canvas
-# does not jump one Tk "unit" at a time.
-MOUSEWHEEL_SCROLL_PIXELS = 48.0
-MOUSEWHEEL_ANIMATION_INTERVAL_MS = 8
-MOUSEWHEEL_ANIMATION_EASING = 0.35
-MOUSEWHEEL_ANIMATION_EPSILON = 0.0007
+MOUSEWHEEL_SEQUENCES = ("<MouseWheel>", "<Button-4>", "<Button-5>")
+TOUCHPAD_SCROLL_SEQUENCE = "<TouchpadScroll>"
+MOUSEWHEEL_FRAME_MS = 16
+MOUSEWHEEL_PIXELS_PER_UNIT = 48.0
+MOUSEWHEEL_MAX_UNITS_PER_FRAME = 4.0
 MODEL_CATALOG_TIMEOUT = 10.0
 SIDEBAR_WIDTH = 328
 CHAT_MAX_WIDTH = 980
@@ -101,6 +99,146 @@ PROCESS_PREVIEW_CHARS = 96
 REMOTE_IMAGE_MARKDOWN_RE = re.compile(
     r"!\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^\s)]+))\s*\)"
 )
+
+
+class _PillBubble(tk.Canvas):
+    """A canvas-backed bubble with fully rounded left and right ends."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        bg: str,
+        outer_bg: str,
+        radius: int = 24,
+    ) -> None:
+        super().__init__(
+            master,
+            bg=outer_bg,
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+        )
+        self._pill_bg = bg
+        self._radius = radius
+        self._content_sync_scheduled = False
+        self._geometry_syncing = False
+        self._last_content_geometry: tuple[int, int] | None = None
+        self._content = tk.Frame(self, bg=bg, bd=0, highlightthickness=0)
+        self._content_window = self.create_window(
+            0,
+            0,
+            window=self._content,
+            anchor="nw",
+        )
+        self.bind("<Configure>", self._on_configure, add="+")
+        self._content.bind("<Configure>", self._schedule_content_sync, add="+")
+        self.after_idle(self._sync_content_geometry)
+
+    @property
+    def content(self) -> tk.Frame:
+        """Return the frame that owns the bubble's normal Tk child widgets."""
+        return self._content
+
+    def _on_configure(self, event: tk.Event) -> None:
+        width = max(1, int(getattr(event, "width", self.winfo_width())))
+        height = max(1, int(getattr(event, "height", self.winfo_height())))
+        # Do not resize the embedded window from the Canvas Configure
+        # callback.  ``itemconfigure`` can itself emit another Configure
+        # event on Tk/macOS, which otherwise re-enters this callback until
+        # Python hits its recursion limit during GUI startup.
+        self._draw_background(width, height)
+
+    def _position_content(self, width: int, height: int) -> None:
+        if getattr(self, "_geometry_syncing", False):
+            return
+        inset = min(self._radius, max(0, width // 2 - 1))
+        # Canvas window items move with ``coords``. ``itemconfigure`` only
+        # accepts window-item options such as width/height; passing x/y there
+        # raises TclError on macOS and stops the GUI event drain.
+        self._geometry_syncing = True
+        try:
+            self.coords(self._content_window, inset, 0)
+            self.itemconfigure(
+                self._content_window,
+                width=max(1, width - 2 * inset),
+                height=max(1, height),
+            )
+        finally:
+            self._geometry_syncing = False
+
+    def _draw_background(self, width: int, height: int) -> None:
+        self.delete("pill-background")
+        radius = min(self._radius, max(1, height // 2), max(1, width // 2))
+        self.create_rectangle(
+            radius,
+            0,
+            width - radius,
+            height,
+            fill=self._pill_bg,
+            outline="",
+            tags="pill-background",
+        )
+        self.create_rectangle(
+            0,
+            radius,
+            width,
+            height - radius,
+            fill=self._pill_bg,
+            outline="",
+            tags="pill-background",
+        )
+        self.create_oval(
+            0,
+            0,
+            2 * radius,
+            2 * radius,
+            fill=self._pill_bg,
+            outline="",
+            tags="pill-background",
+        )
+        self.create_oval(
+            width - 2 * radius,
+            0,
+            width,
+            2 * radius,
+            fill=self._pill_bg,
+            outline="",
+            tags="pill-background",
+        )
+        self.tag_lower("pill-background")
+
+    def _schedule_content_sync(self, _event: tk.Event | None = None) -> None:
+        if self._content_sync_scheduled:
+            return
+        self._content_sync_scheduled = True
+        try:
+            self.after_idle(self._sync_content_geometry)
+        except tk.TclError:
+            self._content_sync_scheduled = False
+
+    def _sync_content_geometry(self) -> None:
+        self._content_sync_scheduled = False
+        try:
+            self._content.update_idletasks()
+            width = max(1, self._content.winfo_reqwidth() + 2 * self._radius)
+            height = max(1, self._content.winfo_reqheight())
+            geometry = (width, height)
+            if (
+                geometry == self._last_content_geometry
+                and self.winfo_width() == width
+                and self.winfo_height() == height
+            ):
+                return
+            # Set this before configure/itemconfigure: those operations may
+            # synchronously schedule a child Configure event.
+            self._last_content_geometry = geometry
+            if self.winfo_width() != width or self.winfo_height() != height:
+                self.configure(width=width, height=height)
+            self._position_content(width, height)
+            self._draw_background(width, height)
+        except tk.TclError:
+            pass
 
 
 def _load_attachment_image(
@@ -281,50 +419,35 @@ def _fetch_model_catalog(api_url: str, api_key: str) -> list[str]:
     return _parse_model_catalog(payload)
 
 
-def _mousewheel_units(event: Any) -> float:
+def _mousewheel_units(event: Any) -> int:
     """Normalize Tk mouse-wheel events across macOS, Windows, and X11."""
     delta = getattr(event, "delta", 0) or 0
     if delta:
         # Tk on macOS commonly reports +/-1, while Windows reports multiples
-        # of 120. Keep the fractional value on Windows so high-resolution
-        # wheels/trackpads do not stall until several events have accumulated.
+        # of 120. Always emit at least one Canvas unit for a non-zero event;
+        # otherwise high-resolution Windows wheels can appear completely dead.
         if platform.system() == "Darwin":
-            return -float(delta) if delta > 0 else float(abs(delta))
-        return -float(delta) / 120.0
+            return -1 if delta > 0 else 1
+        magnitude = max(1, abs(int(delta)) // 120)
+        return -magnitude if delta > 0 else magnitude
 
     button = getattr(event, "num", None)
     if button == 4:
-        return -1.0
+        return -1
     if button == 5:
-        return 1.0
-    return 0.0
+        return 1
+    return 0
 
 
-def _mousewheel_scroll_delta(
-    view: Sequence[float], viewport_height: int, units: float
-) -> float:
-    """Convert wheel units into a fractional yview movement.
-
-    Tk's Canvas and Treeview expose the visible range as fractions of their
-    content. Converting the wheel distance to that same coordinate system
-    gives us pixel-like scrolling without relying on integer ``"units"``
-    jumps, and works for both widgets.
-    """
-    if len(view) < 2 or not units or viewport_height <= 0:
-        return 0.0
+def _touchpad_scroll_units(event: Any) -> float:
+    """Decode Tk 9's packed TouchpadScroll Y delta into wheel-like units."""
     try:
-        visible_fraction = float(view[1]) - float(view[0])
+        packed = int(getattr(event, "delta", 0) or 0)
     except (TypeError, ValueError):
         return 0.0
-    visible_fraction = max(0.0, min(1.0, visible_fraction))
-    if visible_fraction <= 0.0 or visible_fraction >= 1.0:
-        return 0.0
-    return (
-        float(units)
-        * MOUSEWHEEL_SCROLL_PIXELS
-        * visible_fraction
-        / float(viewport_height)
-    )
+    low = packed & 0xFFFF
+    delta_y = low if low < 0x8000 else low - 0x10000
+    return -float(delta_y) / MOUSEWHEEL_PIXELS_PER_UNIT
 
 
 def _app_asset_path(filename: str) -> Path | None:
@@ -569,17 +692,18 @@ class HarnessGUI:
         self._drag_start_y = 0
         self._drag_moved = False
         self._drop_project_path = ""
-        self._body_labels: list[tk.Label] = []
+        # Message bodies use read-only Text widgets instead of Labels so the
+        # user can select and copy both prompts and assistant responses.
+        self._body_labels: list[tk.Text] = []
         self._card_wrappers: list[tk.Frame] = []
         self._active_tool_cards: dict[str, dict[str, Any]] = {}
         self._wrap_refresh_scheduled = False
-        # Each scrollable widget gets one pending target. Wheel events are
-        # merged into that target and reached with short Tk callbacks instead
-        # of issuing a blocking, integer-row scroll for every event.
-        self._mousewheel_scroll_state: dict[str, dict[str, Any]] = {}
         self._model_catalog_loading = False
         self._model_catalog_callbacks: dict[str, Callable[[list[str]], None]] = {}
         self._window_repaint_after_id: str | None = None
+        self._mousewheel_pending: dict[str, float] = {}
+        self._mousewheel_after_ids: dict[str, str] = {}
+        self._chat_autoscroll_token = 0
 
         self._load_state()
         self.root.title(f"AI Harness {__version__} · 张杰")
@@ -607,8 +731,23 @@ class HarnessGUI:
         self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._on_mousewheel, add="+")
         self.root.bind_all("<Button-5>", self._on_mousewheel, add="+")
+        self._mousewheel_sequences = list(MOUSEWHEEL_SEQUENCES)
+        try:
+            # Tk 9 emits TouchpadScroll (not MouseWheel) for high-resolution
+            # devices on macOS and Windows. Tk 8.6 rejects this event name.
+            self.root.bind_all(
+                TOUCHPAD_SCROLL_SEQUENCE,
+                self._on_touchpad_scroll,
+                add="+",
+            )
+            self._mousewheel_sequences.append(TOUCHPAD_SCROLL_SEQUENCE)
+        except tk.TclError:
+            pass
         self._bind_window_repaint_events()
-        self._bind_mousewheel(self.project_tree)
+        # On macOS Tk may deliver a wheel event to the focused widget instead
+        # of the widget currently under the pointer. Bind every concrete
+        # widget early, then route by the live pointer position below.
+        self._bind_mousewheel_tree(self.root)
         self._refresh_project_list()
         self._refresh_session_list()
         self._render_current_session()
@@ -1684,9 +1823,21 @@ class HarnessGUI:
         return widget_path == container_path or widget_path.startswith(container_path + ".")
 
     def _bind_mousewheel(self, widget: tk.Misc) -> None:
-        """Handle scrolling before native widget class bindings can run."""
-        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            widget.bind(sequence, self._on_mousewheel, add="+")
+        """Bind wheel input on the concrete widget before its class binding."""
+        if getattr(widget, "_ai_harness_mousewheel_bound", False):
+            return
+        try:
+            sequences = getattr(self, "_mousewheel_sequences", MOUSEWHEEL_SEQUENCES)
+            for sequence in sequences:
+                callback = (
+                    self._on_touchpad_scroll
+                    if sequence == TOUCHPAD_SCROLL_SEQUENCE
+                    else self._on_mousewheel
+                )
+                widget.bind(sequence, callback, add="+")
+            widget._ai_harness_mousewheel_bound = True
+        except (AttributeError, tk.TclError):
+            pass
 
     def _bind_mousewheel_tree(self, widget: tk.Misc) -> None:
         """Install the early wheel binding on a canvas and all content widgets."""
@@ -1694,135 +1845,145 @@ class HarnessGUI:
         for child in widget.winfo_children():
             self._bind_mousewheel_tree(child)
 
+    def _mousewheel_target(self, event: tk.Event[Any]) -> tk.Misc | None:
+        """Find the scrollable region under a wheel event on every Tk platform."""
+        containers = (
+            getattr(self, "chat_canvas", None),
+            getattr(self, "project_tree", None),
+        )
+        candidates: list[Any] = [getattr(event, "widget", None)]
+        root = getattr(self, "root", None)
+        try:
+            x_root = getattr(event, "x_root")
+            y_root = getattr(event, "y_root")
+            if root is not None:
+                candidates.append(root.winfo_containing(x_root, y_root))
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pass
+        try:
+            if root is not None:
+                pointer_x = root.winfo_pointerx()
+                pointer_y = root.winfo_pointery()
+                candidates.append(root.winfo_containing(pointer_x, pointer_y))
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pass
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for container in containers:
+                if container is not None and self._widget_is_inside(candidate, container):
+                    return container
+        return None
+
     def _on_mousewheel(self, event: tk.Event[Any]) -> str | None:
         units = _mousewheel_units(event)
         if not units:
             return None
-        widget = getattr(event, "widget", None)
-        if widget is not None and self._widget_is_inside(widget, self.chat_canvas):
-            self._scroll_with_mousewheel(self.chat_canvas, units)
-            return "break"
-        if widget is not None and self._widget_is_inside(widget, self.project_tree):
-            self._scroll_with_mousewheel(self.project_tree, units)
-            return "break"
-        return None
+        target = self._mousewheel_target(event)
+        if target is None:
+            return None
+        if target is getattr(self, "chat_canvas", None):
+            self._cancel_chat_autoscroll()
+        self._scroll_with_mousewheel(target, units)
+        return "break"
 
-    def _clear_mousewheel_state(self, widget: tk.Misc | None = None) -> None:
-        """Cancel pending wheel animation callbacks for one or all widgets."""
-        if widget is None:
-            keys = list(self._mousewheel_scroll_state)
-        else:
-            keys = [str(widget)]
+    def _on_touchpad_scroll(self, event: tk.Event[Any]) -> str | None:
+        units = _touchpad_scroll_units(event)
+        if not units:
+            return None
+        target = self._mousewheel_target(event)
+        if target is None:
+            return None
+        if target is getattr(self, "chat_canvas", None):
+            self._cancel_chat_autoscroll()
+        self._scroll_with_mousewheel(target, units)
+        return "break"
+
+    def _scroll_with_mousewheel(self, widget: tk.Misc, units: float) -> None:
+        """Coalesce wheel bursts so complex chat content repaints once per frame."""
+        key = str(widget)
+        pending = getattr(self, "_mousewheel_pending", None)
+        if pending is None:
+            pending = self._mousewheel_pending = {}
+        after_ids = getattr(self, "_mousewheel_after_ids", None)
+        if after_ids is None:
+            after_ids = self._mousewheel_after_ids = {}
+
+        pending[key] = max(
+            -MOUSEWHEEL_MAX_UNITS_PER_FRAME,
+            min(MOUSEWHEEL_MAX_UNITS_PER_FRAME, pending.get(key, 0.0) + units),
+        )
+        if key in after_ids:
+            return
+        root = getattr(self, "root", None)
+        if root is None:
+            self._flush_mousewheel(widget)
+            return
+        try:
+            after_ids[key] = root.after(
+                MOUSEWHEEL_FRAME_MS,
+                self._flush_mousewheel,
+                widget,
+            )
+        except (AttributeError, tk.TclError):
+            pending.pop(key, None)
+
+    def _flush_mousewheel(self, widget: tk.Misc) -> None:
+        """Apply one bounded wheel movement after merging events for a UI frame."""
+        key = str(widget)
+        getattr(self, "_mousewheel_after_ids", {}).pop(key, None)
+        units = getattr(self, "_mousewheel_pending", {}).pop(key, 0.0)
+        if not units:
+            return
+
+        # Treeview has row-based scrolling and is cheap to repaint. The chat
+        # Canvas contains many embedded Tk widgets, so move it by a pixel-like
+        # fraction only once per frame instead of redrawing for every event.
+        if widget is getattr(self, "project_tree", None):
+            try:
+                widget.yview_scroll(int(round(units)), "units")
+            except (AttributeError, tk.TclError):
+                pass
+            return
+        try:
+            view = tuple(float(value) for value in widget.yview())
+            viewport_height = max(1, int(widget.winfo_height()))
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            return
+        if len(view) < 2:
+            return
+        visible_fraction = max(0.0, min(1.0, view[1] - view[0]))
+        if visible_fraction <= 0.0 or visible_fraction >= 1.0:
+            return
+        delta = (
+            units
+            * MOUSEWHEEL_PIXELS_PER_UNIT
+            * visible_fraction
+            / viewport_height
+        )
+        maximum = max(0.0, 1.0 - visible_fraction)
+        target = max(0.0, min(maximum, view[0] + delta))
+        if target == view[0]:
+            return
+        try:
+            widget.yview_moveto(target)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _clear_mousewheel_queue(self, widget: tk.Misc | None = None) -> None:
+        """Cancel queued wheel work when changing sessions or closing the GUI."""
+        pending = getattr(self, "_mousewheel_pending", {})
+        after_ids = getattr(self, "_mousewheel_after_ids", {})
+        keys = list(after_ids) if widget is None else [str(widget)]
         for key in keys:
-            state = self._mousewheel_scroll_state.pop(key, None)
-            if not state:
-                continue
-            after_id = state.get("after_id")
+            after_id = after_ids.pop(key, None)
             if after_id is not None:
                 try:
                     self.root.after_cancel(after_id)
-                except tk.TclError:
+                except (AttributeError, tk.TclError):
                     pass
-
-    @staticmethod
-    def _clamp_mousewheel_target(target: float, visible_fraction: float) -> float:
-        """Keep a yview target inside the scrollable range."""
-        maximum = max(0.0, 1.0 - visible_fraction)
-        return max(0.0, min(maximum, target))
-
-    def _scroll_with_mousewheel(self, widget: tk.Misc, units: float) -> None:
-        """Merge wheel input into a short, pixel-like scrolling animation."""
-        try:
-            view = tuple(float(value) for value in widget.yview())
-            viewport_height = int(widget.winfo_height())
-        except (AttributeError, TypeError, ValueError, tk.TclError):
-            return
-        if len(view) < 2:
-            return
-        visible_fraction = max(0.0, min(1.0, view[1] - view[0]))
-        delta = _mousewheel_scroll_delta(view, viewport_height, units)
-        if not delta:
-            return
-
-        key = str(widget)
-        state = self._mousewheel_scroll_state.get(key)
-        if state is None:
-            state = {
-                "target": view[0],
-                "last_position": view[0],
-                "after_id": None,
-            }
-            self._mousewheel_scroll_state[key] = state
-        else:
-            # A scrollbar drag, session render, or auto-scroll may move the
-            # widget while a wheel animation is pending. Do not add a new
-            # wheel delta to that stale target.
-            last_position = float(state.get("last_position", view[0]))
-            if abs(view[0] - last_position) > max(0.02, visible_fraction * 0.25):
-                state["target"] = view[0]
-
-        state["target"] = self._clamp_mousewheel_target(
-            float(state.get("target", view[0])) + delta,
-            visible_fraction,
-        )
-        if state.get("after_id") is None:
-            state["after_id"] = self.root.after(
-                MOUSEWHEEL_ANIMATION_INTERVAL_MS,
-                self._animate_mousewheel,
-                widget,
-            )
-
-    def _animate_mousewheel(self, widget: tk.Misc) -> None:
-        """Ease one widget toward its merged wheel target at UI cadence."""
-        key = str(widget)
-        state = self._mousewheel_scroll_state.get(key)
-        if state is None:
-            return
-        state["after_id"] = None
-        try:
-            view = tuple(float(value) for value in widget.yview())
-            viewport_height = int(widget.winfo_height())
-        except (AttributeError, TypeError, ValueError, tk.TclError):
-            self._mousewheel_scroll_state.pop(key, None)
-            return
-        if len(view) < 2:
-            self._mousewheel_scroll_state.pop(key, None)
-            return
-        visible_fraction = max(0.0, min(1.0, view[1] - view[0]))
-        if visible_fraction <= 0.0 or visible_fraction >= 1.0 or viewport_height <= 0:
-            self._mousewheel_scroll_state.pop(key, None)
-            return
-
-        current = view[0]
-        last_position = float(state.get("last_position", current))
-        if abs(current - last_position) > max(0.02, visible_fraction * 0.25):
-            # An external movement wins over the old animation target.
-            state["target"] = current
-
-        target = self._clamp_mousewheel_target(
-            float(state.get("target", current)), visible_fraction
-        )
-        distance = target - current
-        if abs(distance) <= MOUSEWHEEL_ANIMATION_EPSILON:
-            try:
-                widget.yview_moveto(target)
-            except (AttributeError, tk.TclError):
-                pass
-            self._mousewheel_scroll_state.pop(key, None)
-            return
-
-        next_position = current + distance * MOUSEWHEEL_ANIMATION_EASING
-        try:
-            widget.yview_moveto(next_position)
-        except (AttributeError, tk.TclError):
-            self._mousewheel_scroll_state.pop(key, None)
-            return
-        state["last_position"] = next_position
-        state["after_id"] = self.root.after(
-            MOUSEWHEEL_ANIMATION_INTERVAL_MS,
-            self._animate_mousewheel,
-            widget,
-        )
+            pending.pop(key, None)
 
     def _refresh_project_list(self) -> None:
         self._refresh_project_tree()
@@ -2199,7 +2360,7 @@ class HarnessGUI:
 
     def _render_current_session(self) -> None:
         record = self._current_record()
-        self._clear_mousewheel_state(self.chat_canvas)
+        self._clear_mousewheel_queue(self.chat_canvas)
         for child in self.chat_inner.winfo_children():
             child.destroy()
         self._body_labels.clear()
@@ -2454,6 +2615,44 @@ class HarnessGUI:
             return max(220, min(680, available - 70))
         return max(260, available)
 
+    def _selectable_body_width(self, role: str, body: str) -> int:
+        """Return a reasonable initial Text width for a chat card.
+
+        Assistant cards fill the reading column, while user bubbles keep
+        their compact, content-sized appearance. Text widgets express their
+        requested width in average characters, so only the latter needs an
+        explicit width before geometry has been calculated.
+        """
+        if role != "user":
+            return 1
+        max_chars = max(20, self._initial_card_wraplength(role) // 10)
+        longest_line = max((len(line) for line in body.splitlines()), default=1)
+        return min(max_chars, max(20, longest_line))
+
+    @staticmethod
+    def _set_selectable_body_text(widget: tk.Text, text: str) -> None:
+        """Replace the contents of a read-only chat body safely."""
+        current_state = str(widget.cget("state"))
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", str(text))
+        widget.configure(state=current_state)
+
+    @staticmethod
+    def _selectable_body_line_count(widget: tk.Text) -> int:
+        """Count wrapped display lines so a Text body never gets an inner scrollbar."""
+        # tkinter.Text.count adds the leading dash itself. Passing
+        # ``-displaylines`` produces the invalid Tcl option
+        # ``--displaylines`` and leaves every body at its initial one-line
+        # height. ``update`` also forces wrapped-line metrics to be current.
+        count = widget.count("1.0", "end-1c", "update", "displaylines")
+        if isinstance(count, (tuple, list)):
+            count = count[0] if count else 0
+        try:
+            return max(1, int(count or 0))
+        except (TypeError, ValueError):
+            return 1
+
     def _schedule_card_wrap_refresh(self) -> None:
         if self._wrap_refresh_scheduled:
             return
@@ -2464,15 +2663,16 @@ class HarnessGUI:
         self._wrap_refresh_scheduled = False
         try:
             self.chat_inner.update_idletasks()
-            for label in self._body_labels:
-                if not label.winfo_exists():
+            for body_widget in self._body_labels:
+                if not body_widget.winfo_exists():
                     continue
-                bubble = label.master
-                available = bubble.winfo_width() - 30
-                if available > 0:
-                    wraplength = max(180, available)
-                    if int(label.cget("wraplength")) != wraplength:
-                        label.configure(wraplength=wraplength)
+                body_widget.configure(
+                    height=self._selectable_body_line_count(body_widget)
+                )
+                content = body_widget.master
+                bubble = getattr(content, "master", None)
+                if isinstance(bubble, _PillBubble):
+                    bubble._schedule_content_sync()
             side_padding = self._chat_side_padding()
             for wrapper in self._card_wrappers:
                 if wrapper.winfo_exists():
@@ -2554,7 +2754,7 @@ class HarnessGUI:
             except tk.TclError:
                 continue
         self._schedule_card_wrap_refresh()
-        self.root.after_idle(self._scroll_chat_to_bottom)
+        self._schedule_chat_to_bottom()
 
     def _toggle_process_card(self, card: dict[str, Any]) -> str:
         """Expand or collapse one Think/Search/Pwsh row in place."""
@@ -2586,7 +2786,7 @@ class HarnessGUI:
                 if isinstance(indicator, tk.Misc):
                     indicator.configure(text="›")
             self._schedule_card_wrap_refresh()
-            self.root.after_idle(self._scroll_chat_to_bottom)
+            self._schedule_chat_to_bottom()
         except tk.TclError:
             return "break"
         return "break"
@@ -2686,13 +2886,14 @@ class HarnessGUI:
         wrapper.pack(fill="x", padx=self._chat_side_padding(), pady=(12, 5))
         self._card_wrappers.append(wrapper)
         if role == "user":
-            bubble = tk.Frame(
+            bubble = _PillBubble(
                 wrapper,
                 bg=COLORS["user_bubble"],
-                highlightthickness=1,
-                highlightbackground="#d9e3f7",
+                outer_bg=COLORS["app"],
             )
             bubble.pack(anchor="e", padx=(220, 0))
+            bubble_content = bubble.content
+            bubble_bg = COLORS["user_bubble"]
             title_color = COLORS["text"]
         elif is_process:
             bubble = tk.Frame(
@@ -2701,6 +2902,8 @@ class HarnessGUI:
                 highlightthickness=0,
             )
             bubble.pack(anchor="w", fill="x")
+            bubble_content = bubble
+            bubble_bg = str(bubble["bg"])
             title_color = COLORS["muted"]
         elif role == "tool":
             bubble = tk.Frame(
@@ -2710,6 +2913,8 @@ class HarnessGUI:
                 highlightbackground=COLORS["border"],
             )
             bubble.pack(anchor="w", fill="x")
+            bubble_content = bubble
+            bubble_bg = str(bubble["bg"])
             title_color = COLORS["warning"]
         else:
             bubble = tk.Frame(
@@ -2718,16 +2923,19 @@ class HarnessGUI:
                 highlightthickness=0,
             )
             bubble.pack(anchor="w", fill="x")
+            bubble_content = bubble
+            bubble_bg = str(bubble["bg"])
             title_color = COLORS["text"]
-        header = tk.Frame(bubble, bg=bubble["bg"], cursor="hand2" if is_process else "")
-        header.pack(fill="x", padx=0 if is_process else 16, pady=(4, 6) if is_process else (12, 6))
+        header: tk.Frame | None = None
         process_indicator: tk.Label | None = None
         preview_label: tk.Label | None = None
         if is_process:
+            header = tk.Frame(bubble_content, bg=bubble_bg, cursor="hand2")
+            header.pack(fill="x", padx=0, pady=(4, 6))
             process_indicator = tk.Label(
                 header,
                 text="›",
-                bg=bubble["bg"],
+                bg=bubble_bg,
                 fg=COLORS["subtle"],
                 font=(UI_FONT, 11),
                 width=2,
@@ -2738,7 +2946,7 @@ class HarnessGUI:
             tk.Label(
                 header,
                 text=PROCESS_ICONS.get(title, "·"),
-                bg=bubble["bg"],
+                bg=bubble_bg,
                 fg=COLORS["subtle"],
                 font=(UI_FONT, 10),
                 width=2,
@@ -2748,7 +2956,7 @@ class HarnessGUI:
             tk.Label(
                 header,
                 text=title,
-                bg=bubble["bg"],
+                bg=bubble_bg,
                 fg=title_color,
                 font=(UI_FONT, 9, "bold"),
                 anchor="w",
@@ -2757,7 +2965,7 @@ class HarnessGUI:
             tk.Label(
                 header,
                 text="·",
-                bg=bubble["bg"],
+                bg=bubble_bg,
                 fg=COLORS["subtle"],
                 font=(UI_FONT, 9),
                 padx=7,
@@ -2767,43 +2975,62 @@ class HarnessGUI:
             preview_label = tk.Label(
                 header,
                 text=_compact_process_preview(display_body),
-                bg=bubble["bg"],
+                bg=bubble_bg,
                 fg=COLORS["muted"],
                 font=(UI_FONT, 9),
                 anchor="w",
                 cursor="hand2",
             )
             preview_label.pack(side="left", fill="x", expand=True)
-        else:
+        elif role != "user":
+            header = tk.Frame(bubble_content, bg=bubble_bg)
+            header.pack(fill="x", padx=16, pady=(12, 6))
             tk.Label(
                 header,
                 text=title,
-                bg=bubble["bg"],
+                bg=bubble_bg,
                 fg=title_color,
                 font=(UI_FONT, 9, "bold"),
                 anchor="w",
             ).pack(side="left")
-        body_label = tk.Label(
-            bubble,
-            text=display_body,
-            bg=bubble["bg"],
+        body_label = tk.Text(
+            bubble_content,
+            bg=bubble_bg,
             fg=COLORS["text"] if role != "tool" else COLORS["muted"],
-            justify="left",
-            anchor="w",
-            wraplength=self._initial_card_wraplength(role),
+            wrap="word",
             font=(UI_FONT, 10),
-            padx=17,
-            pady=0,
+            width=self._selectable_body_width(role, display_body),
+            height=1,
+            padx=20 if role == "user" else 17,
+            pady=12 if role == "user" else 0,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            insertwidth=0,
+            cursor="arrow",
+            takefocus=False,
+            exportselection=False,
+            selectbackground="#dfe7fb",
+            selectforeground=COLORS["text"],
+            undo=False,
+            autoseparators=False,
         )
+        body_label.insert("1.0", display_body)
+        # Keep the normal Text class bindings for mouse selection and Ctrl/Cmd-C,
+        # while disabling all edits to the transcript itself.
+        body_label.configure(state="disabled")
         has_images = bool(chat_image_items or remote_image_refs)
         image_column: tk.Frame | None = None
         if is_process:
             body_label.pack_forget()
         else:
-            body_label.pack(fill="x", pady=(0, 7 if has_images else 13))
+            body_label.pack(
+                fill="x",
+                pady=(0, 7 if has_images else (0 if role == "user" else 13)),
+            )
         self._body_labels.append(body_label)
         if has_images:
-            image_column = tk.Frame(bubble, bg=bubble["bg"])
+            image_column = tk.Frame(bubble_content, bg=bubble_bg)
             image_column.pack(fill="x", padx=15, pady=(0, 13))
             for photo in chat_image_items:
                 tk.Label(
@@ -2865,7 +3092,9 @@ class HarnessGUI:
             "process_base_body": display_body,
         }
         if is_process:
-            for widget in header.winfo_children() + [header, body_label, bubble]:
+            # Toggling belongs to the compact process header. Leaving the
+            # body out of this binding is important: the body is selectable.
+            for widget in header.winfo_children() + [header]:
                 widget.bind(
                     "<Button-1>",
                     lambda _event, target=card: self._toggle_process_card(target),
@@ -2873,9 +3102,9 @@ class HarnessGUI:
                 )
         if role == "user":
             user_prompt = str(prompt_text if prompt_text is not None else body)
-            prompt_actions = tk.Frame(bubble, bg=bubble["bg"])
+            prompt_actions = tk.Frame(bubble_content, bg=bubble_bg)
             button_options = {
-                "bg": bubble["bg"],
+                "bg": bubble_bg,
                 "fg": COLORS["subtle"],
                 "activebackground": COLORS["panel_hover"],
                 "activeforeground": COLORS["text"],
@@ -2905,7 +3134,7 @@ class HarnessGUI:
                 tk.Label(
                     prompt_actions,
                     text=timestamp,
-                    bg=bubble["bg"],
+                    bg=bubble_bg,
                     fg=COLORS["subtle"],
                     font=(UI_FONT, 8),
                     padx=5,
@@ -2920,8 +3149,7 @@ class HarnessGUI:
         if not self._rendering_history:
             self._bind_mousewheel_tree(wrapper)
         self._schedule_card_wrap_refresh()
-        self.root.after_idle(self._scroll_chat_to_bottom)
-        self.root.after(80, self._scroll_chat_to_bottom)
+        self._schedule_chat_to_bottom()
         return card
 
     def _update_tool_progress(self, session_id: str, message: str) -> None:
@@ -2953,14 +3181,14 @@ class HarnessGUI:
             return
         try:
             display_body = _remove_remote_image_markdown(body)
-            body_label.configure(text=display_body)
+            self._set_selectable_body_text(body_label, display_body)
             card["body"] = body
             card["display_body"] = display_body
             preview_label = card.get("preview_label")
             if isinstance(preview_label, tk.Misc) and not card.get("expanded"):
                 preview_label.configure(text=_compact_process_preview(display_body))
             self._schedule_card_wrap_refresh()
-            self.root.after_idle(self._scroll_chat_to_bottom)
+            self._schedule_chat_to_bottom()
         except tk.TclError:
             self._active_tool_cards.pop(session_id, None)
 
@@ -2995,6 +3223,39 @@ class HarnessGUI:
             if bounds is not None:
                 self.chat_canvas.configure(scrollregion=bounds)
             self.chat_canvas.yview_moveto(1.0)
+        except tk.TclError:
+            pass
+
+    def _schedule_chat_to_bottom(self) -> None:
+        """Follow new output until nested Text/bubble geometry has settled."""
+        self._chat_autoscroll_token = getattr(self, "_chat_autoscroll_token", 0) + 1
+        token = self._chat_autoscroll_token
+        try:
+            self.root.after_idle(self._settle_chat_to_bottom, token, 0)
+        except tk.TclError:
+            pass
+
+    def _cancel_chat_autoscroll(self) -> None:
+        """Let a manual wheel action take control from pending output follow-up."""
+        self._chat_autoscroll_token = getattr(self, "_chat_autoscroll_token", 0) + 1
+
+    def _settle_chat_to_bottom(self, token: int, attempt: int) -> None:
+        """Repeat bottom alignment while asynchronous card sizes stabilize."""
+        if token != getattr(self, "_chat_autoscroll_token", 0) or getattr(
+            self, "closing", False
+        ):
+            return
+        self._scroll_chat_to_bottom()
+        delays = (40, 80, 160, 320)
+        if attempt >= len(delays):
+            return
+        try:
+            self.root.after(
+                delays[attempt],
+                self._settle_chat_to_bottom,
+                token,
+                attempt + 1,
+            )
         except tk.TclError:
             pass
 
@@ -4116,7 +4377,7 @@ class HarnessGUI:
 
     def _on_close(self) -> None:
         self.closing = True
-        self._clear_mousewheel_state()
+        self._clear_mousewheel_queue()
         for runtime in self.runtimes.values():
             session = runtime["session"]
             if session is not None:

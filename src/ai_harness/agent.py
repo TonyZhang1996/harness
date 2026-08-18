@@ -80,7 +80,10 @@ TOOL_DEFINITIONS = [
                     "query": {"type": "string", "description": "Public web search query."},
                     "engine": {"type": "string", "enum": ["baidu", "bing"]},
                     "max_chars": {"type": "integer", "description": "Maximum result text."},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds, 5-120."},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds, 5-30; default is 15.",
+                    },
                     "image_search": {
                         "type": "boolean",
                         "description": (
@@ -276,7 +279,8 @@ TOOL_HANDLERS: dict[str, Callable[..., str]] = {
 
 SYSTEM_PROMPT = """You are AI Harness, a careful local coding agent.
 Inspect the project before changing it. Use tools instead of inventing file contents or command results.
-For current or external information, including news, prices, people, laws, schedules, and public web facts, you MUST call browser_search before answering. browser_search is the persistent built-in headless browser tool shared by every Session. For requests involving photos, images, portraits, avatars, or wallpapers, request image_search=true or rely on its automatic image-query detection. When browser_search returns Markdown image previews, preserve every useful `![...](...)` line in the final answer so the GUI can render the pictures; do not replace image previews with only a search-page link. Do not use run_command to create a temporary web-search script and do not answer current-information questions from memory alone.
+For questions about this repository, AI Harness, its provider presets, endpoints, models, or documentation, inspect local files with search_text/read_file first; those local sources are authoritative for the installed version. Use browser_search only when the local files do not answer the question or the user explicitly asks for current external verification.
+For genuinely current or external information, including news, prices, people, laws, schedules, and public web facts, you MUST call browser_search before answering. For a simple factual lookup, use one focused query and answer after a useful result; do not repeat near-duplicate searches. browser_search is the persistent built-in headless browser tool shared by every Session. For requests involving photos, images, portraits, avatars, or wallpapers, request image_search=true or rely on its automatic image-query detection. When browser_search returns Markdown image previews, preserve every useful `![...](...)` line in the final answer so the GUI can render the pictures; do not replace image previews with only a search-page link. Do not use run_command to create a temporary web-search script and do not answer current-information questions from memory alone.
 If browser_search reports that Playwright is missing, use the exact interpreter and commands shown in that tool result; do not substitute `python`, `py`, or another environment. Attempt dependency repair at most once. If the same browser error remains after the repair, stop retrying and explain the concrete error to the user.
 Prefer targeted edits. After meaningful code changes, run the relevant tests or checks when command execution is approved.
 Never claim a file changed, a command ran, or a test passed unless the corresponding tool succeeded.
@@ -612,6 +616,8 @@ def _is_transient_model_error(exc: Exception) -> bool:
 
 class AgentSession:
     """A stateful model/tool session for interactive conversations."""
+
+    MAX_BROWSER_SEARCH_CALLS_PER_TURN = 3
 
     PERMISSION_ALIASES = {
         "ask": "ask",
@@ -993,6 +999,7 @@ class AgentSession:
             )
 
         browser_failure_count = 0
+        browser_search_count = 0
         for _ in range(self.max_turns):
             self._raise_if_stopped()
             if self._apply_direction_changes():
@@ -1044,11 +1051,22 @@ class AgentSession:
                     tool_call.function.name, tool_call.function.arguments
                 )
                 self._emit("tool_start", summary)
-                result = _execute_tool(
-                    tool_call.function.name,
-                    tool_call.function.arguments,
-                    self.tool_handlers,
-                )
+                if tool_call.function.name == "browser_search":
+                    browser_search_count += 1
+                if (
+                    tool_call.function.name == "browser_search"
+                    and browser_search_count > self.MAX_BROWSER_SEARCH_CALLS_PER_TURN
+                ):
+                    result = (
+                        "本轮 browser_search 已达到 3 次上限。请停止继续搜索，"
+                        "直接根据已有搜索结果和用户问题给出答案。"
+                    )
+                else:
+                    result = _execute_tool(
+                        tool_call.function.name,
+                        tool_call.function.arguments,
+                        self.tool_handlers,
+                    )
                 repeated_browser_failure = False
                 if _is_browser_search_failure(tool_call.function.name, result):
                     browser_failure_count += 1

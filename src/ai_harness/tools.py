@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlencode, urlsplit
 
+from .config import OPENCODE_GO_BASE_URL
+
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright
 except ImportError:  # pragma: no cover - actionable runtime error below
@@ -74,8 +76,35 @@ IMAGE_QUERY_MARKERS = (
     "headshot",
 )
 MAX_BROWSER_IMAGE_RESULTS = 8
+BROWSER_SEARCH_DEFAULT_TIMEOUT = 15
+BROWSER_SEARCH_MAX_TIMEOUT = 30
+BROWSER_SEARCH_SETTLE_MILLISECONDS = 150
+BROWSER_SEARCH_CACHE_TTL = 60.0
 ApprovalCallback = Callable[[str, Path], bool]
 CommandProgressCallback = Callable[[str], None]
+
+_BROWSER_SEARCH_CACHE: dict[tuple[str, str, bool, int], tuple[float, str]] = {}
+_BROWSER_SEARCH_CACHE_LOCK = threading.Lock()
+_HARNESS_URL_QUERY_MARKERS = (
+    "url",
+    "网址",
+    "地址",
+    "链接",
+    "endpoint",
+    "端点",
+    "api",
+    "接口",
+    "订阅",
+    "subscription",
+)
+_HARNESS_PURCHASE_QUERY_MARKERS = (
+    "购买",
+    "付款",
+    "账单",
+    "checkout",
+    "payment",
+    "buy",
+)
 
 
 def _load_sync_playwright() -> Callable[..., Any] | None:
@@ -168,6 +197,28 @@ def _browser_image_search_url(query: str, engine: str) -> str:
 def _looks_like_image_query(query: str) -> bool:
     normalized = query.casefold()
     return any(marker in normalized for marker in IMAGE_QUERY_MARKERS)
+
+
+def _known_harness_config_result(query: str) -> str | None:
+    """Answer built-in provider URL questions without launching a browser.
+
+    The active workspace is often a user project rather than the AI Harness
+    source tree, so asking the model to search the workspace cannot reliably
+    discover the harness's own provider defaults. Keep this narrow: purchase
+    and billing-page questions still go through normal web search.
+    """
+    normalized = query.casefold()
+    if "opencode" not in normalized or not re.search(r"\bgo\b", normalized):
+        return None
+    if not any(marker in normalized for marker in _HARNESS_URL_QUERY_MARKERS):
+        return None
+    if any(marker in normalized for marker in _HARNESS_PURCHASE_QUERY_MARKERS):
+        return None
+    return (
+        "本地配置命中：AI Harness 当前 OpenCode Go API URL 是 "
+        f"{OPENCODE_GO_BASE_URL}\n"
+        "来源：src/ai_harness/config.py:13。这里是 API 接口地址，不是购买或账单页面。"
+    )
 
 
 def _normalize_browser_image_url(raw_url: Any) -> str | None:
@@ -276,7 +327,11 @@ def _browser_search_once(
                 wait_until="domcontentloaded",
                 timeout=timeout * 1000,
             )
-            page.wait_for_timeout(1_000)
+            # Search results are already available after DOMContentLoaded on
+            # both supported engines. A short settle period handles the
+            # dynamic result list without adding a fixed one-second delay to
+            # every search call.
+            page.wait_for_timeout(BROWSER_SEARCH_SETTLE_MILLISECONDS)
             title = page.title()
             final_url = page.url
             body = page.inner_text("body")
@@ -544,7 +599,7 @@ def browser_search(
     query: str,
     engine: str = "baidu",
     max_chars: int = 12_000,
-    timeout: int = 45,
+    timeout: int = BROWSER_SEARCH_DEFAULT_TIMEOUT,
     workspace_root: str | Path | None = None,
     allowed_roots: Iterable[str | Path] | None = None,
     approval_callback: ApprovalCallback | None = None,
@@ -563,12 +618,17 @@ def browser_search(
         raise ValueError("engine 只能是 baidu 或 bing")
     if max_chars < 1:
         raise ValueError("max_chars 必须大于 0")
-    if timeout < 5 or timeout > 120:
-        raise ValueError("timeout 必须在 5 到 120 秒之间")
+    if timeout < 5 or timeout > BROWSER_SEARCH_MAX_TIMEOUT:
+        raise ValueError(
+            f"timeout 必须在 5 到 {BROWSER_SEARCH_MAX_TIMEOUT} 秒之间"
+        )
 
     if image_search is None:
         image_search = _looks_like_image_query(query)
     root = _get_workspace_root(workspace_root)
+    known_config_result = _known_harness_config_result(query)
+    if known_config_result is not None:
+        return known_config_result
     search_kind = "图片搜索" if image_search else "网页搜索"
     approval_text = (
         f"使用无头浏览器访问公开搜索引擎 {engine}进行{search_kind}，"
@@ -576,6 +636,21 @@ def browser_search(
     )
     if approval_callback is None or not approval_callback(approval_text, root):
         return "浏览器搜索被用户或审批策略拒绝"
+
+    cache_key = (
+        query.strip().casefold(),
+        engine,
+        bool(image_search),
+        max_chars,
+    )
+    now = time.monotonic()
+    with _BROWSER_SEARCH_CACHE_LOCK:
+        cached = _BROWSER_SEARCH_CACHE.get(cache_key)
+        if cached is not None:
+            cached_at, cached_result = cached
+            if now - cached_at <= BROWSER_SEARCH_CACHE_TTL:
+                return cached_result + "\n\n说明：已复用 60 秒内的相同搜索结果。"
+            _BROWSER_SEARCH_CACHE.pop(cache_key, None)
 
     sync_playwright = _load_sync_playwright()
     if sync_playwright is None:
@@ -641,6 +716,8 @@ def browser_search(
 
         if candidate_engine != engine:
             result += f"\n\n说明：{engine} 访问失败，已自动回退到 {candidate_engine}。"
+        with _BROWSER_SEARCH_CACHE_LOCK:
+            _BROWSER_SEARCH_CACHE[cache_key] = (time.monotonic(), result)
         return result
 
     detail = "\n".join(failures) or "未返回具体错误"
