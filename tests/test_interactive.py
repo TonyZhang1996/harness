@@ -590,6 +590,31 @@ def test_gui_mousewheel_target_is_clamped_to_content_bounds():
     assert HarnessGUI._clamp_mousewheel_target(0.9, 0.25) == pytest.approx(0.75)
 
 
+def test_connection_change_defers_busy_session_rebuild():
+    from ai_harness.gui import HarnessGUI
+
+    live_session = object()
+    busy_runtime = {
+        "session": live_session,
+        "busy": True,
+        "rebuild_session_after_busy": False,
+    }
+    idle_runtime = {
+        "session": object(),
+        "busy": False,
+        "rebuild_session_after_busy": True,
+    }
+
+    HarnessGUI._invalidate_sessions_for_connection_change(
+        [busy_runtime, idle_runtime]
+    )
+
+    assert busy_runtime["session"] is live_session
+    assert busy_runtime["rebuild_session_after_busy"] is True
+    assert idle_runtime["session"] is None
+    assert idle_runtime["rebuild_session_after_busy"] is False
+
+
 def test_gui_runs_multiple_sessions_concurrently(monkeypatch, tmp_path):
     """Two Sessions can run agent turns in parallel with independent history."""
     tkinter = pytest.importorskip("tkinter")

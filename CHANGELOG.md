@@ -9,6 +9,9 @@
 - Cut a Windows single-file GUI release from the current workspace as `AI-Harness-0.6.0.exe`.
 - Keep API keys and local sessions outside the executable; connection settings and GUI state remain per-user under `%USERPROFILE%\\.ai-harness\\`.
 - Updated the package, GUI title, CLI version, and smoke-test version marker to 0.6.0.
+- Bundle the matching Playwright Chromium browsers into the Windows executable so public search works on a clean recipient machine.
+- Defer live Session client rebuilds after connection changes so running tasks remain stoppable and steerable.
+- Make the Windows source launcher repository-relative and remove obsolete Tavily configuration from the delivery instructions.
 
 ## 0.5.0 — 2026-08-17
 

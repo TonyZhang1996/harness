@@ -95,6 +95,18 @@ def _load_sync_playwright() -> Callable[..., Any] | None:
     return candidate
 
 
+def _configure_bundled_playwright_browsers() -> Path | None:
+    """Point a frozen build at the browser binaries packed inside the app."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if not bundle_root:
+        return None
+    browsers_path = Path(bundle_root) / "playwright-browsers"
+    if not browsers_path.is_dir():
+        return None
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_path)
+    return browsers_path
+
+
 def _playwright_command(module: str, *arguments: str) -> str:
     """Render a copyable command using the interpreter running AI Harness."""
     return subprocess.list2cmdline([sys.executable, "-m", module, *arguments])
@@ -231,6 +243,7 @@ def _browser_search_once(
     image_search: bool,
 ) -> str:
     """Run one isolated browser search attempt."""
+    _configure_bundled_playwright_browsers()
     search_url = (
         _browser_image_search_url(query, engine)
         if image_search
@@ -566,6 +579,11 @@ def browser_search(
 
     sync_playwright = _load_sync_playwright()
     if sync_playwright is None:
+        if getattr(sys, "_MEIPASS", None):
+            return (
+                "浏览器搜索不可用：当前 AI Harness 发行包未包含 Playwright 浏览器内核。"
+                "请重新下载完整的 Windows 发行包，不要尝试在 EXE 上执行 Python 安装命令。"
+            )
         install_package = _playwright_command("pip", "install", "playwright")
         install_browser = _playwright_command("playwright", "install", "chromium")
         return (
@@ -599,6 +617,11 @@ def browser_search(
         except Exception as exc:
             detail = str(exc).strip() or type(exc).__name__
             if _is_missing_playwright_browser(detail):
+                if getattr(sys, "_MEIPASS", None):
+                    return (
+                        "浏览器搜索失败：当前 AI Harness 发行包未包含 Playwright 浏览器内核。"
+                        "请重新下载完整的 Windows 发行包。"
+                    )
                 install_browser = _playwright_command("playwright", "install", "chromium")
                 detail = (
                     "Playwright 浏览器内核未安装。请在运行 AI Harness 的同一个"

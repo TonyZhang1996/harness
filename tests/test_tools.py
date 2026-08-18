@@ -1,3 +1,4 @@
+import os
 import json
 import platform
 import shlex
@@ -207,6 +208,38 @@ def test_playwright_is_loaded_lazily_after_runtime_install(monkeypatch):
 
     assert tools_module._load_sync_playwright() is fake_sync_playwright
     assert tools_module._sync_playwright is fake_sync_playwright
+
+
+def test_frozen_build_uses_bundled_playwright_browsers(tmp_path: Path, monkeypatch):
+    bundle_root = tmp_path / "bundle"
+    browsers_root = bundle_root / "playwright-browsers"
+    browsers_root.mkdir(parents=True)
+    monkeypatch.setattr(tools_module.sys, "_MEIPASS", str(bundle_root), raising=False)
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+
+    assert tools_module._configure_bundled_playwright_browsers() == browsers_root
+    assert os.environ["PLAYWRIGHT_BROWSERS_PATH"] == str(browsers_root)
+
+
+def test_frozen_browser_search_reports_missing_bundled_browser(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(tools_module.sys, "_MEIPASS", str(tmp_path / "bundle"), raising=False)
+    monkeypatch.setattr(tools_module, "_sync_playwright", None)
+    monkeypatch.setattr(
+        tools_module.importlib,
+        "import_module",
+        lambda _name: (_ for _ in ()).throw(ImportError("not installed")),
+    )
+
+    result = browser_search(
+        "缺少发行包浏览器",
+        workspace_root=tmp_path,
+        approval_callback=lambda _action, _cwd: True,
+    )
+
+    assert "发行包未包含" in result
+    assert "不要尝试" in result
 
 
 def test_browser_search_reports_the_running_interpreter_when_playwright_is_missing(
