@@ -47,4 +47,4 @@ AgentSession --- conversation history
 
 `browser_search` 是所有 Session 共享的固定工具。它只允许访问百度或 Bing 的公开搜索入口，使用新建的无 Cookie Chromium 上下文，并沿用当前 Session 的审批回调；模型不能通过它访问任意 URL、本地文件或用户浏览器登录状态。系统提示要求遇到当前或外部信息时优先调用该工具，避免每个 Session 临时创建搜索脚本。
 
-`--full-access` 是显式的会话级权限提升：文件系统根目录加入授权范围，敏感文件保护解除，命令审批切换为自动允许。交互模式也可以用 `/permissions` 在 `ask`、`auto`、`never` 和 `full-access` 之间即时切换。每次切换都会重新绑定全部工具的路径边界、敏感文件策略和审批回调；该模式不会持久化到后续会话。
+`--full-access` 是显式的会话级权限提升：文件系统根目录加入授权范围，敏感文件保护解除，命令审批切换为自动允许。交互模式也可以用 `/permissions` 在 `ask`、`auto` 和 `full-access` 之间即时切换（`never` 为底层保留模式，不通过 CLI 暴露）。每次切换都会重新绑定全部工具的路径边界、敏感文件策略和审批回调；该模式不会持久化到后续会话。
