@@ -895,6 +895,7 @@ class HarnessGUI:
                 state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             state = {}
+        self._state = state
 
         for project in state.get("projects", []):
             if isinstance(project, dict) and project.get("path"):
@@ -935,13 +936,18 @@ class HarnessGUI:
             self.sessions.append(record)
             self.current_session_id = record["id"]
 
+    def _state_get(self, key: str, default: Any = None) -> Any:
+        return self._state.get(key, default)
+
     def _save_state(self) -> None:
         self._snapshot_agent_messages()
+        self._state["sidebar_collapsed"] = bool(self._sidebar_collapsed)
         payload = {
             "version": 1,
             "projects": self.projects,
             "sessions": self.sessions,
             "current_session_id": self.current_session_id,
+            "sidebar_collapsed": self._state.get("sidebar_collapsed", False),
         }
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1175,21 +1181,94 @@ class HarnessGUI:
     def _build_layout(self) -> None:
         outer = ttk.Frame(self.root, style="App.TFrame")
         outer.pack(fill="both", expand=True)
+        self._layout_root = outer
 
-        accent_rail = tk.Frame(outer, width=1, bg=COLORS["border"])
-        accent_rail.pack(side="left", fill="y")
+        self.accent_rail = tk.Frame(outer, width=1, bg=COLORS["border"])
+        self.accent_rail.pack(side="left", fill="y")
         self.sidebar = ttk.Frame(outer, width=SIDEBAR_WIDTH, style="Sidebar.TFrame")
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
+        self._sidebar_collapsed = bool(
+            self._state_get("sidebar_collapsed", False)
+        )
         self._build_sidebar()
 
-        divider = tk.Frame(outer, width=1, bg=COLORS["border"])
-        divider.pack(side="left", fill="y")
+        self.divider = tk.Frame(outer, width=1, bg=COLORS["border"])
+        self.divider.pack(side="left", fill="y")
         content = ttk.Frame(outer, style="App.TFrame")
         content.pack(side="left", fill="both", expand=True)
         self._build_header(content)
         self._build_chat(content)
         self._build_composer(content)
+
+        self._build_collapsed_rail(outer)
+        if self._sidebar_collapsed:
+            self._apply_sidebar_collapsed(initial=True)
+
+    def _build_collapsed_rail(self, outer: ttk.Frame) -> None:
+        """A slim vertical rail shown when the sidebar is collapsed."""
+        self.sidebar_collapsed = tk.Frame(
+            outer,
+            width=46,
+            bg=COLORS["sidebar"],
+        )
+        self.sidebar_collapsed.pack_propagate(False)
+        rail_top = tk.Frame(self.sidebar_collapsed, bg=COLORS["sidebar"])
+        rail_top.pack(fill="x")
+        self._expand_sidebar_button = tk.Button(
+            rail_top,
+            text="»",
+            command=self.expand_sidebar,
+            bg=COLORS["sidebar"],
+            fg=COLORS["muted"],
+            activebackground=COLORS["panel_hover"],
+            activeforeground=COLORS["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=8,
+            pady=14,
+            font=(UI_FONT, 11),
+            cursor="hand2",
+        )
+        self._expand_sidebar_button.pack(side="left", padx=(15, 0))
+
+    def _apply_sidebar_collapsed(self, initial: bool = False) -> None:
+        """Show or hide the sidebar and its surrounding rails in one step."""
+        if self._sidebar_collapsed:
+            self.accent_rail.pack_forget()
+            self.sidebar.pack_forget()
+            self.divider.pack_forget()
+            self.sidebar_collapsed.pack(side="left", fill="y")
+        else:
+            self.sidebar_collapsed.pack_forget()
+            self.accent_rail.pack(side="left", fill="y")
+            self.sidebar.pack(side="left", fill="y")
+            self.sidebar.pack_propagate(False)
+            self.divider.pack(side="left", fill="y")
+        if not initial:
+            self._save_state()
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def collapse_sidebar(self) -> None:
+        """Collapse the sidebar to a slim rail."""
+        self._sidebar_collapsed = True
+        self._apply_sidebar_collapsed()
+
+    def expand_sidebar(self) -> None:
+        """Restore the sidebar to its full width."""
+        self._sidebar_collapsed = False
+        self._apply_sidebar_collapsed()
+
+    def toggle_sidebar(self) -> None:
+        """Collapse the sidebar if shown, otherwise expand it."""
+        if self._sidebar_collapsed:
+            self.expand_sidebar()
+        else:
+            self.collapse_sidebar()
 
     def _build_sidebar(self) -> None:
         brand = tk.Frame(self.sidebar, bg=COLORS["sidebar"])
@@ -1227,6 +1306,23 @@ class HarnessGUI:
             fg=COLORS["subtle"],
             font=(UI_FONT, 8),
         ).pack(side="right", anchor="n")
+        self._collapse_sidebar_button = tk.Button(
+            brand,
+            text="‹",
+            command=self.collapse_sidebar,
+            bg=COLORS["sidebar"],
+            fg=COLORS["text"],
+            activebackground=COLORS["panel_hover"],
+            activeforeground=COLORS["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=6,
+            pady=0,
+            font=(UI_FONT, 11, "bold"),
+            cursor="hand2",
+        )
+        self._collapse_sidebar_button.pack(side="right", anchor="n", padx=(0, 6))
 
         ttk.Button(
             self.sidebar,
